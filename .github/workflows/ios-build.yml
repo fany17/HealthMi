@@ -1,0 +1,106 @@
+name: iOS build and test
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - 'HealthMi/**'
+      - 'HealthMiTests/**'
+      - 'project.yml'
+      - '.github/workflows/ios-build.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  build-and-test:
+    runs-on: macos-15
+    timeout-minutes: 45
+    env:
+      DEVELOPER_DIR: /Applications/Xcode_16.4.app/Contents/Developer
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Check out source
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+
+      - name: Prepare XcodeGen and record tool versions
+        run: |
+          mkdir -p build
+          xcodebuild -version | tee build/xcode-version.log
+          xcrun swift --version | tee build/swift-version.log
+          if ! command -v xcodegen >/dev/null; then
+            brew install xcodegen
+          fi
+          xcodegen --version | tee build/xcodegen-version.log
+          git rev-parse HEAD > build/source-commit.txt
+
+      - name: Generate the original Xcode project
+        run: |
+          xcodegen generate
+          xcodebuild -project HealthMi.xcodeproj -list -json > build/project.json
+
+      - name: Build for iOS Simulator
+        run: |
+          xcodebuild -project HealthMi.xcodeproj -scheme HealthMi \
+            -destination 'generic/platform=iOS Simulator' \
+            -derivedDataPath build/DerivedData \
+            CODE_SIGNING_ALLOWED=NO build 2>&1 | tee build/simulator-build.log
+
+      - name: Run native XCTest on a clean simulator
+        run: |
+          SIM_UDID=$(xcrun simctl create 'HealthMi CI' \
+            com.apple.CoreSimulator.SimDeviceType.iPhone-16 \
+            com.apple.CoreSimulator.SimRuntime.iOS-18-5)
+          xcrun simctl boot "$SIM_UDID"
+          xcrun simctl bootstatus "$SIM_UDID" -b
+          xcodebuild -project HealthMi.xcodeproj -scheme HealthMi \
+            -destination "platform=iOS Simulator,id=$SIM_UDID" \
+            -destination-timeout 120 \
+            -derivedDataPath build/DerivedData \
+            -resultBundlePath build/HealthMiTests.xcresult \
+            -parallel-testing-enabled NO \
+            CODE_SIGNING_ALLOWED=NO test 2>&1 | tee build/xctest.log
+
+      - name: Archive an unsigned iPhone app after tests pass
+        run: |
+          xcodebuild -project HealthMi.xcodeproj -scheme HealthMi \
+            -configuration Release -destination 'generic/platform=iOS' \
+            -archivePath build/HealthMi.xcarchive \
+            CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO \
+            archive 2>&1 | tee build/device-archive.log
+          mkdir -p build/Payload
+          ditto build/HealthMi.xcarchive/Products/Applications/HealthMi.app \
+            build/Payload/HealthMi.app
+          ditto -c -k --keepParent build/Payload build/HealthMi-unsigned.ipa
+          cp HealthMi/Support/HealthMi.entitlements build/HealthMi.entitlements
+          shasum -a 256 build/HealthMi-unsigned.ipa > build/HealthMi-unsigned.ipa.sha256
+
+      - name: Upload unsigned IPA (requires HealthKit signing before installation)
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: HealthMi-unsigned-${{ github.sha }}
+          path: |
+            build/HealthMi-unsigned.ipa
+            build/HealthMi-unsigned.ipa.sha256
+            build/HealthMi.entitlements
+            build/source-commit.txt
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: Upload build logs and native test results
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: HealthMi-build-results-${{ github.sha }}
+          path: |
+            build/*.log
+            build/project.json
+            build/source-commit.txt
+            build/HealthMiTests.xcresult
+          if-no-files-found: warn
+          retention-days: 7

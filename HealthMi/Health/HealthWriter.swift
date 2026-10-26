@@ -4,7 +4,7 @@ import Foundation
 /// 幂等写入器，复刻 `healthloom.app` 的 `HealthKitWriter` 模式：
 /// - 每个样本带 `HKMetadataKeyExternalUUID`；
 /// - 写入前按「类型 + 时间段」一次查询已有的 externalID，内存里 diff 后只保存新增批次；
-/// - 更新 = 按 externalID 删除 + 重插（HK 样本不可变）。
+/// - 普通样本回填先保存新数据，再按旧对象身份清理（HK 样本不可变）。
 actor HealthWriter {
     private let store: HKHealthStore
 
@@ -18,6 +18,7 @@ actor HealthWriter {
         let predicate = NSCompoundPredicate(andPredicateWithSubpredicates: [
             HKQuery.predicateForSamples(withStart: start, end: end),
             HKQuery.predicateForObjects(withMetadataKey: HKMetadataKeyExternalUUID),
+            HKQuery.predicateForObjects(from: HKSource.default()),
         ])
         var ids = Set<String>()
         var anchor: Date? = nil
@@ -108,10 +109,10 @@ actor HealthWriter {
     @discardableResult
     func delete(ofType type: HKObjectType, externalIDs: Set<String>) async throws -> Int {
         guard !externalIDs.isEmpty else { return 0 }
-        let predicate = HKQuery.predicateForObjects(
-            withMetadataKey: HKMetadataKeyExternalUUID,
-            allowedValues: Array(externalIDs)
-        )
+        let predicate = NSCompoundPredicate(andPredicateWithSubpredicates: [
+            HKQuery.predicateForObjects(withMetadataKey: HKMetadataKeyExternalUUID, allowedValues: Array(externalIDs)),
+            HKQuery.predicateForObjects(from: HKSource.default()),
+        ])
         return try await withCheckedThrowingContinuation { continuation in
             store.deleteObjects(of: type, predicate: predicate) { _, count, error in
                 if let error {
@@ -123,12 +124,30 @@ actor HealthWriter {
         }
     }
 
+    /// 普通样本回填：先保存新数据，再删除本次查询捕获的旧对象。
+    /// 不按 externalID 在保存后重查，否则会把相同 externalID 的新样本一并删除。
+    /// 这不是原子事务：清理失败/进程中断可能暂留重复，重跑同范围回填可再次清理。
+    func replace(_ batch: [HKObject], ofType type: HKSampleType, start: Date, end: Date) async throws {
+        guard !batch.isEmpty else { return }
+        let predicate = NSCompoundPredicate(andPredicateWithSubpredicates: [
+            HKQuery.predicateForSamples(withStart: start, end: end),
+            HKQuery.predicateForObjects(withMetadataKey: HKMetadataKeyExternalUUID),
+            HKQuery.predicateForObjects(from: HKSource.default()),
+        ])
+        let previous = try await queryPage(type: type, predicate: predicate, anchor: nil, limit: HKObjectQueryNoLimit)
+        try await store.save(batch)
+        // 保存失败时不会进入删除；删除失败则上抛，不返回成功游标。
+        if !previous.isEmpty {
+            try await store.delete(previous)
+        }
+    }
+
     // MARK: - 分页查询
 
     private static let pageSize = 1000
 
     private func queryPage(
-        type: HKSampleType, predicate: NSPredicate, anchor: Date?
+        type: HKSampleType, predicate: NSPredicate, anchor: Date?, limit: Int = HealthWriter.pageSize
     ) async throws -> [HKSample] {
         var combined = predicate
         if let anchor {
@@ -141,7 +160,7 @@ actor HealthWriter {
         return try await withCheckedThrowingContinuation { continuation in
             let query = HKSampleQuery(
                 sampleType: type, predicate: combined,
-                limit: Self.pageSize, sortDescriptors: [sort]
+                limit: limit, sortDescriptors: [sort]
             ) { _, samples, error in
                 if let error {
                     continuation.resume(throwing: error)

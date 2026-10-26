@@ -1,0 +1,176 @@
+import Foundation
+
+// These doubles intentionally implement only the API used by AppModel.
+// They have no network, Keychain, HealthKit or database access.
+enum Authorization { case notDetermined, sharingDenied, sharingAuthorized }
+struct HKQuantityType: Hashable {
+    enum Identifier { case stepCount, sleepAnalysis }
+    let identifier: Identifier
+    init(_ identifier: Identifier) { self.identifier = identifier }
+}
+let HKErrorDomain = "VirtualHealthKit"
+enum HKError {
+    enum Code: Int { case errorAuthorizationDenied = 1, errorAuthorizationNotDetermined = 2 }
+}
+enum MiLoginError: Error { case loginRejected }
+struct HealthSummary {}
+struct DailyTrend {}
+struct MiStressSample: Equatable {
+    let timestamp: Date
+    let stressScore: Int
+    var id: String { "stress_\(timestamp.timeIntervalSince1970)" }
+}
+struct SyncOutcome {
+    let type: SyncDataType
+    let fetched: Int
+    let added: Int
+    let highWater: Date
+}
+struct SyncState { var lastSyncedEnd: Date? }
+
+@MainActor final class ModelContext {
+    var states: [SyncDataType: SyncState] = [:]
+    var successes: [SyncDataType] = []
+    var failures: [SyncDataType] = []
+    var stressRecords: [MiStressSample] = []
+}
+
+// Deterministically pause the first connection, exposing MainActor reentrancy.
+@MainActor final class ConnectionGate {
+    private var entered = false
+    private var observer: CheckedContinuation<Void, Never>?
+    private var blocked: CheckedContinuation<Void, Never>?
+    func pause() async {
+        await withCheckedContinuation { continuation in
+            blocked = continuation
+            entered = true
+            observer?.resume()
+            observer = nil
+        }
+    }
+    func waitUntilEntered() async {
+        if entered { return }
+        await withCheckedContinuation { observer = $0 }
+    }
+    func release() {
+        blocked?.resume()
+        blocked = nil
+    }
+}
+
+@MainActor enum Fixture {
+    static var available = true
+    static var stepPermission: Authorization = .sharingAuthorized
+    static var sleepPermission: Authorization = .sharingAuthorized
+    static var credentialsExist = true
+    static var failConnection = false
+    static var connectionCount = 0
+    static var gate: ConnectionGate?
+    struct Call {
+        let type: SyncDataType
+        let highWater: Date?
+        let backfillDays: Int
+        let forceBackfill: Bool
+    }
+    static var calls: [Call] = []
+    static var writes: [SyncDataType] = []
+    static var notifications: [String] = []
+    static var stressSamples: [MiStressSample] = []
+    static var failStressSave = false
+    static var stressRange: ClosedRange<Date> { clock.addingTimeInterval(-7 * 86400)...clock }
+    static let clock = Date(timeIntervalSince1970: 1_780_000_000)
+
+    static func reset() {
+        available = true
+        stepPermission = .sharingAuthorized
+        sleepPermission = .sharingAuthorized
+        credentialsExist = true
+        failConnection = false
+        connectionCount = 0
+        gate = nil
+        calls = []
+        writes = []
+        notifications = []
+        stressSamples = []
+        failStressSave = false
+    }
+}
+
+@MainActor enum CredentialStore {
+    static func migrateIfNeeded() {}
+    static func save(userId: String, passToken: String) throws {}
+    static func load() -> (userId: String, passToken: String)? {
+        Fixture.credentialsExist ? ("synthetic-user", "synthetic-token") : nil
+    }
+    static func delete() {}
+}
+@MainActor struct VirtualHealthStore {
+    func authorizationStatus(for type: HKQuantityType) -> Authorization {
+        type.identifier == .stepCount ? Fixture.stepPermission : Fixture.sleepPermission
+    }
+}
+@MainActor enum HealthKitManager {
+    static var isAvailable: Bool { Fixture.available }
+    static let healthStore = VirtualHealthStore()
+    static let typesToShare: Set<HKQuantityType> = [.init(.stepCount), .init(.sleepAnalysis)]
+    static func requestAuthorization() async throws {}
+}
+@MainActor enum HealthKitReader {
+    static func summary(days: Int) async -> HealthSummary { HealthSummary() }
+    static func trendSeries(days: Int) async -> [DailyTrend] { [] }
+}
+@MainActor enum NotificationManager {
+    static func notifySyncFailure(_ message: String) async { Fixture.notifications.append(message) }
+}
+@MainActor enum SyncStateStore {
+    static func state(for type: SyncDataType, in context: ModelContext) -> SyncState? {
+        context.states[type]
+    }
+    static func record(type: SyncDataType, highWater: Date?, added: Int, in context: ModelContext) {
+        context.states[type] = SyncState(lastSyncedEnd: highWater)
+    }
+    static func clearAll(in context: ModelContext) { context.states = [:] }
+}
+@MainActor enum StressStore {
+    static func clearAll(in context: ModelContext) { context.stressRecords = [] }
+    static func save(samples: [MiStressSample], in context: ModelContext) -> Int {
+        if !Fixture.failStressSave { context.stressRecords += samples }
+        return samples.count
+    }
+    static func replace(samples: [MiStressSample], range: ClosedRange<Date>, in context: ModelContext) throws -> Int {
+        if Fixture.failStressSave { throw MiLoginError.loginRejected }
+        context.stressRecords.removeAll { range.contains($0.timestamp) }
+        context.stressRecords += samples.filter { range.contains($0.timestamp) }
+        return samples.count
+    }
+}
+@MainActor enum SyncLogStore {
+    static func clearAll(in context: ModelContext) {}
+    static func append(type: SyncDataType, fetched: Int, added: Int, success: Bool,
+                       errorMessage: String? = nil, in context: ModelContext) {
+        if success { context.successes.append(type) } else { context.failures.append(type) }
+    }
+}
+@MainActor final class SyncEngine {
+    func connect(userId: String, passToken: String) async throws {
+        Fixture.connectionCount += 1
+        if Fixture.connectionCount == 1, let gate = Fixture.gate { await gate.pause() }
+        if Fixture.failConnection { throw MiLoginError.loginRejected }
+    }
+    func clearCache() async {}
+    func sync(type: SyncDataType, highWater: Date?, backfillDays: Int,
+              forceBackfill: Bool = false) async throws -> SyncOutcome {
+        Fixture.calls.append(.init(type: type, highWater: highWater,
+                                   backfillDays: backfillDays, forceBackfill: forceBackfill))
+        let permission = type == .dailyActivity ? Fixture.stepPermission : Fixture.sleepPermission
+        guard permission == .sharingAuthorized else {
+            throw NSError(domain: HKErrorDomain, code: HKError.Code.errorAuthorizationDenied.rawValue)
+        }
+        Fixture.writes.append(type)
+        return SyncOutcome(type: type, fetched: 1, added: 1, highWater: Fixture.clock)
+    }
+    func syncStress(highWater: Date?, backfillDays: Int,
+                    forceBackfill: Bool = false) async throws -> (samples: [MiStressSample], outcome: SyncOutcome, range: ClosedRange<Date>) {
+        (Fixture.stressSamples, SyncOutcome(type: .stress, fetched: Fixture.stressSamples.count, added: 0, highWater: Fixture.clock), Fixture.stressRange)
+    }
+}

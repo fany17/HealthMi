@@ -46,4 +46,49 @@ final class SyncStateStoreTests: XCTestCase {
         let state = SyncStateStore.state(for: type, in: context)
         XCTAssertEqual(state?.lastAddedCount, 20)
     }
+
+    func testStressBackfillPreservesOutsideHistoryAndDeduplicatesInput() throws {
+        let schema = Schema([StressRecord.self])
+        let container = try ModelContainer(for: schema, configurations: [
+            ModelConfiguration(schema: schema, isStoredInMemoryOnly: true),
+        ])
+        let context = ModelContext(container)
+        let before = MiStressSample(timestamp: Date(timeIntervalSince1970: 99), stressScore: 10)
+        let inside = MiStressSample(timestamp: Date(timeIntervalSince1970: 100), stressScore: 20)
+        let after = MiStressSample(timestamp: Date(timeIntervalSince1970: 201), stressScore: 30)
+        for sample in [before, inside, after] {
+            context.insert(StressRecord(externalID: sample.id, timestamp: sample.timestamp, stressScore: sample.stressScore))
+        }
+        try context.save()
+        let updated = MiStressSample(timestamp: inside.timestamp, stressScore: 40)
+        let added = try StressStore.replace(
+            samples: [updated, updated],
+            range: Date(timeIntervalSince1970: 100)...Date(timeIntervalSince1970: 200), in: context
+        )
+        // Read with another context to check committed data rather than cached objects.
+        let records = try ModelContext(container).fetch(FetchDescriptor<StressRecord>())
+        XCTAssertEqual(added, 1)
+        XCTAssertEqual(records.count, 3)
+        XCTAssertEqual(records.first { $0.externalID == inside.id }?.stressScore, 40)
+        XCTAssertEqual(records.first { $0.externalID == before.id }?.stressScore, 10)
+        XCTAssertEqual(records.first { $0.externalID == after.id }?.stressScore, 30)
+    }
+
+    func testEmptyStressBackfillClearsOnlyRequestedRange() throws {
+        let schema = Schema([StressRecord.self])
+        let container = try ModelContainer(for: schema, configurations: [
+            ModelConfiguration(schema: schema, isStoredInMemoryOnly: true),
+        ])
+        let context = ModelContext(container)
+        for seconds in [99, 100, 200, 201] {
+            context.insert(StressRecord(externalID: "test_\(seconds)", timestamp: Date(timeIntervalSince1970: Double(seconds)), stressScore: 10))
+        }
+        try context.save()
+        let added = try StressStore.replace(
+            samples: [], range: Date(timeIntervalSince1970: 100)...Date(timeIntervalSince1970: 200), in: context
+        )
+        let records = try ModelContext(container).fetch(FetchDescriptor<StressRecord>())
+        XCTAssertEqual(added, 0)
+        XCTAssertEqual(Set(records.map(\.externalID)), ["test_99", "test_201"])
+    }
 }

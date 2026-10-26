@@ -132,10 +132,10 @@ final class AppModel {
             healthKitAuthorized = false
             return
         }
-        let status = HealthKitManager.healthStore.authorizationStatus(
-            for: HKQuantityType(.stepCount)
-        )
-        healthKitAuthorized = (status == .sharingAuthorized)
+        // 允许用户只授权睡眠等部分类型，不以步数权限代表全部权限。
+        healthKitAuthorized = HealthKitManager.typesToShare.contains { type in
+            HealthKitManager.healthStore.authorizationStatus(for: type) == .sharingAuthorized
+        }
     }
 
     // MARK: - 同步
@@ -165,17 +165,20 @@ final class AppModel {
     ///   - forceBackfill: 为 true 时忽略增量游标，按 `backfillDays` 重新回填历史。
     ///   - isBackground: 是否为后台同步触发（失败时发送本地通知）。
     func syncAll(modelContext: ModelContext, forceBackfill: Bool = false, isBackground: Bool = false) async {
+        // MainActor 上先占用入口，再执行任何 await，避免前台/后台交错启动。
+        guard !isSyncing else { return }
         isSyncing = true
         lastError = nil
         defer { isSyncing = false }
 
         // 新增类型（如呼吸频率）可能还没授权，先补齐授权，否则写入会被 HealthKit 拒绝
         await ensureHealthKitAuthorization()
-        // 检查用户是否在系统设置中撤销了权限
+        // 具体类型的写权限由 HealthKit 写入时检查，并沿用下方逐类型错误处理。
+        // 不能因为用户拒绝步数权限，就阻止已授权的睡眠等类型同步。
         refreshHealthKitStatus()
-        guard healthKitAuthorized else {
-            lastError = "HealthKit 写入权限未授权，请在 设置 → 健康 → 数据访问 中允许 HealthMi"
-            statusMessage = "❌ HealthKit 权限未授权"
+        guard HealthKitManager.isAvailable else {
+            lastError = AppError.healthKitUnavailable.localizedDescription
+            statusMessage = "❌ \(AppError.healthKitUnavailable.localizedDescription)"
             return
         }
 
@@ -205,10 +208,12 @@ final class AppModel {
                         forceBackfill: forceBackfill
                     )
                     if let result {
+                        let added: Int
                         if forceBackfill {
-                            StressStore.clearAll(in: modelContext)
+                            added = try StressStore.replace(samples: result.samples, range: result.range, in: modelContext)
+                        } else {
+                            added = StressStore.save(samples: result.samples, in: modelContext)
                         }
-                        let added = StressStore.save(samples: result.samples, in: modelContext)
                         let outcome = SyncOutcome(
                             type: .stress, fetched: result.samples.count,
                             added: added, highWater: result.outcome.highWater

@@ -45,7 +45,28 @@ enum StressStore {
         return added
     }
 
-    /// 删除指定时间范围内的压力记录（重新回填时先清理）。
+    /// 只替换本次云端查询范围；使用独立上下文一次提交，保存失败不删除持久化历史。
+    /// 禁用自动保存，失败时丢弃未提交的上下文，不回滚界面上下文中的其他修改。
+    static func replace(samples: [MiStressSample], range: ClosedRange<Date>, in context: ModelContext) throws -> Int {
+        let writeContext = ModelContext(context.container)
+        writeContext.autosaveEnabled = false
+        let start = range.lowerBound
+        let end = range.upperBound
+        let descriptor = FetchDescriptor<StressRecord>(
+            predicate: #Predicate { $0.timestamp >= start && $0.timestamp <= end }
+        )
+        for record in try writeContext.fetch(descriptor) {
+            writeContext.delete(record)
+        }
+        var seen = Set<String>()
+        for sample in samples where range.contains(sample.timestamp) && seen.insert(sample.id).inserted {
+            writeContext.insert(StressRecord(externalID: sample.id, timestamp: sample.timestamp, stressScore: sample.stressScore))
+        }
+        try writeContext.save()
+        return seen.count
+    }
+
+    /// 删除指定时间范围内的压力记录。
     static func deleteRange(start: Date, end: Date, in context: ModelContext) {
         let descriptor = FetchDescriptor<StressRecord>(
             predicate: #Predicate { $0.timestamp >= start && $0.timestamp <= end }

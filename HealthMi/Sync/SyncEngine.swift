@@ -73,11 +73,14 @@ actor SyncEngine {
         }
         let startTime = MiAPIClient.dayStartEpoch(of: start)
         let endTime = MiAPIClient.dayEndEpoch(of: now)
+        // 查重/替换与云端查询使用同一日边界，覆盖首日零点到原始 start 之间的数据。
+        let queryStart = Date(timeIntervalSince1970: Double(startTime))
+        let queryEnd = Date(timeIntervalSince1970: Double(endTime))
 
         // 运动记录用 HKWorkoutBuilder 单独写入（不走通用分组保存）
         if type == .workouts {
             return try await syncWorkouts(
-                startTime: startTime, endTime: endTime, start: start, end: now,
+                startTime: startTime, endTime: endTime, start: queryStart, end: queryEnd,
                 forceBackfill: forceBackfill
             )
         }
@@ -87,24 +90,19 @@ actor SyncEngine {
         var added = 0
         var fetched = 0
         for group in groups {
-            let existing = try await writer.existingExternalIDs(
-                ofType: group.sampleType, start: start, end: now
-            )
+            // 云端按睡眠会话时间选中记录时，首段可能在查询日之前；查重必须覆盖完整片段。
+            let samples = group.objects.compactMap { $0 as? HKSample }
+            let existingStart = min(queryStart, samples.map(\.startDate).min() ?? queryStart)
+            let existingEnd = max(queryEnd, samples.map(\.endDate).max() ?? queryEnd)
             if forceBackfill {
-                // 重新回填 = 重写：删除范围内**我们已写入的所有样本**（外部 ID 匹配），再插入最新数据。
-                // 删除全部而非仅交集，是为了清理旧版写入的已废弃样本（如旧的整晚 asleep 聚合样本）。
-                // 分块删除，避免单个谓词过长（大量样本时）。
-                if !existing.isEmpty {
-                    let chunkSize = 500
-                    let all = Array(existing)
-                    for index in stride(from: 0, to: all.count, by: chunkSize) {
-                        let end = min(index + chunkSize, all.count)
-                        try await writer.delete(ofType: group.sampleType, externalIDs: Set(all[index..<end]))
-                    }
-                }
-                try await writer.save(group.objects)
+                try await writer.replace(
+                    group.objects, ofType: group.sampleType, start: existingStart, end: existingEnd
+                )
                 added += group.objects.count
             } else {
+                let existing = try await writer.existingExternalIDs(
+                    ofType: group.sampleType, start: existingStart, end: existingEnd
+                )
                 let fresh = group.objects.filter { object in
                     guard let uuid = object.metadata?[HKMetadataKeyExternalUUID] as? String else {
                         return true
@@ -122,16 +120,17 @@ actor SyncEngine {
 
     /// 压力数据同步：从云端拉取 stress key，返回解析后的压力样本。
     /// 压力数据无 HealthKit 对应类型，由 AppModel 写入 SwiftData。
-    /// - Returns: (压力样本列表, 同步结果摘要)
+    /// - Returns: (压力样本列表, 同步结果摘要, 实际云端查询范围)
     func syncStress(
         highWater: Date?, backfillDays: Int, forceBackfill: Bool = false
-    ) async throws -> (samples: [MiStressSample], outcome: SyncOutcome) {
-        let (start, now, startTime, endTime) = syncWindow(
+    ) async throws -> (samples: [MiStressSample], outcome: SyncOutcome, range: ClosedRange<Date>) {
+        let (_, now, startTime, endTime) = syncWindow(
             highWater: highWater, backfillDays: backfillDays, forceBackfill: forceBackfill
         )
         let items = try await client.fetchData(key: "stress", startTime: startTime, endTime: endTime)
         let samples = MiParser.stressSamples(items)
-        return (samples, SyncOutcome(type: .stress, fetched: samples.count, added: 0, highWater: now))
+        let range = Date(timeIntervalSince1970: Double(startTime))...Date(timeIntervalSince1970: Double(endTime))
+        return (samples, SyncOutcome(type: .stress, fetched: samples.count, added: 0, highWater: now), range)
     }
 
     // MARK: - 窗口计算
@@ -247,6 +246,13 @@ actor SyncEngine {
     /// 按 HealthKit 样本类型分组（同一个同步批次内的不同 HK 类型需要分别去重）。
     private func groupBySampleType(_ samples: [HKSample]) -> [HKGroup] {
         Dictionary(grouping: samples, by: { $0.sampleType })
-            .map { HKGroup(sampleType: $0.key, objects: $0.value) }
+            .map { type, values in
+                var seen = Set<String>()
+                let unique = values.filter { sample in
+                    guard let id = sample.metadata?[HKMetadataKeyExternalUUID] as? String else { return true }
+                    return seen.insert(id).inserted
+                }
+                return HKGroup(sampleType: type, objects: unique)
+            }
     }
 }
