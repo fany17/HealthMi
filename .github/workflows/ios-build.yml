@@ -51,13 +51,26 @@ jobs:
             -derivedDataPath build/DerivedData \
             CODE_SIGNING_ALLOWED=NO build 2>&1 | tee build/simulator-build.log
 
-      - name: Run native XCTest on a clean simulator
+      - name: Compile native XCTest before booting the simulator
+        run: |
+          xcodebuild -project HealthMi.xcodeproj -scheme HealthMi \
+            -destination 'generic/platform=iOS Simulator' \
+            -derivedDataPath build/DerivedData \
+            CODE_SIGNING_ALLOWED=NO build-for-testing 2>&1 | tee build/test-build.log
+
+      - name: Boot a clean iPhone simulator
+        timeout-minutes: 10
         run: |
           SIM_UDID=$(xcrun simctl create 'HealthMi CI' \
             com.apple.CoreSimulator.SimDeviceType.iPhone-16 \
             com.apple.CoreSimulator.SimRuntime.iOS-18-5)
+          echo "SIM_UDID=$SIM_UDID" >> "$GITHUB_ENV"
           xcrun simctl boot "$SIM_UDID"
           xcrun simctl bootstatus "$SIM_UDID" -b
+
+      - name: Run native XCTest on the clean simulator
+        timeout-minutes: 15
+        run: |
           xcodebuild -project HealthMi.xcodeproj -scheme HealthMi \
             -destination "platform=iOS Simulator,id=$SIM_UDID" \
             -destination-timeout 120 \

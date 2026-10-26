@@ -4,20 +4,15 @@ import XCTest
 
 @MainActor
 final class SyncStateStoreTests: XCTestCase {
-    private var container: ModelContainer!
-    private var context: ModelContext!
-
-    nonisolated override func setUp() async throws {
-        try await super.setUp()
-        try await MainActor.run {
-            let schema = Schema([SyncState.self])
-            let config = ModelConfiguration(schema: schema, isStoredInMemoryOnly: true)
-            container = try ModelContainer(for: schema, configurations: [config])
-            context = container.mainContext
-        }
+    private func makeContainer() throws -> ModelContainer {
+        let schema = Schema([SyncState.self])
+        let config = ModelConfiguration(schema: schema, isStoredInMemoryOnly: true)
+        return try ModelContainer(for: schema, configurations: [config])
     }
 
-    func testRecordUpdatesState() {
+    func testRecordUpdatesState() throws {
+        let container = try makeContainer()
+        let context = container.mainContext
         let type: SyncDataType = .heartRate
         let highWater = Date()
         SyncStateStore.record(type: type, highWater: highWater, added: 42, in: context)
@@ -28,7 +23,9 @@ final class SyncStateStoreTests: XCTestCase {
         XCTAssertEqual(state?.lastAddedCount, 42)
     }
 
-    func testClearAllRemovesAllStates() {
+    func testClearAllRemovesAllStates() throws {
+        let container = try makeContainer()
+        let context = container.mainContext
         SyncStateStore.record(type: .heartRate, highWater: Date(), added: 10, in: context)
         SyncStateStore.record(type: .sleep, highWater: Date(), added: 5, in: context)
         SyncStateStore.record(type: .spo2, highWater: Date(), added: 3, in: context)
@@ -40,7 +37,9 @@ final class SyncStateStoreTests: XCTestCase {
         }
     }
 
-    func testRecordTwiceUpdatesSameRow() {
+    func testRecordTwiceUpdatesSameRow() throws {
+        let container = try makeContainer()
+        let context = container.mainContext
         let type: SyncDataType = .heartRate
         SyncStateStore.record(type: type, highWater: Date(timeIntervalSinceNow: -3600), added: 10, in: context)
         SyncStateStore.record(type: type, highWater: Date(), added: 20, in: context)
