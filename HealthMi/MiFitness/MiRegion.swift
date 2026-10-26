@@ -17,10 +17,11 @@ enum MiRegion: String, CaseIterable, Identifiable, Sendable {
     /// 该区域的本地时区（用于计算日边界）。
     var timeZone: TimeZone {
         switch self {
-        case .cn, .i2, .sg: return TimeZone(secondsFromGMT: 8 * 3600)!
-        case .ru: return TimeZone(secondsFromGMT: 3 * 3600)!
-        case .de: return TimeZone(secondsFromGMT: 1 * 3600)!
-        case .us: return TimeZone(secondsFromGMT: -8 * 3600)!
+        case .cn: return TimeZone(identifier: "Asia/Shanghai")!
+        case .i2, .sg: return TimeZone(identifier: "Asia/Singapore")!
+        case .ru: return TimeZone(identifier: "Europe/Moscow")!
+        case .de: return TimeZone(identifier: "Europe/Berlin")!
+        case .us: return TimeZone(identifier: "America/Los_Angeles")!
         }
     }
 

@@ -28,10 +28,11 @@ import Foundation
             let context = ModelContext()
             let old = Date(timeIntervalSince1970: 100)
             context.states[.dailyActivity] = SyncState(lastSyncedEnd: old)
+            context.states[.sleep] = SyncState(lastSyncedEnd: old)
             await model.syncAll(modelContext: context, isBackground: true)
             return Fixture.writes == [.sleep] && context.states[.dailyActivity]?.lastSyncedEnd == old
                 && context.states[.sleep]?.lastSyncedEnd == Fixture.clock
-                && context.failures == [.dailyActivity] && Fixture.notifications.count == 1
+                && context.failures == [.dailyActivity] && Fixture.notifications.isEmpty && Fixture.summaryReads == 0
         }
         await check("denied sleep never writes or advances its cursor") {
             Fixture.sleepPermission = .sharingDenied
@@ -60,7 +61,7 @@ import Foundation
                     && model.statusMessage == "first task is waiting"
                     && model.lastError == "preserve active task status"
                 gate.release()
-                await first.value
+                _ = await first.value
                 return preserved && Fixture.writes == [.sleep] && !model.isSyncing
             }
         }
@@ -126,7 +127,7 @@ import Foundation
             context.stressRecords = [old, stale]
             Fixture.stressSamples = [fresh]
             await model.syncAll(modelContext: context, forceBackfill: true)
-            return context.stressRecords == [old, fresh] && context.states[.stress]?.lastSyncedEnd == Fixture.clock
+            return context.stressRecords == [old, fresh] && context.states[.stress] == nil
         }
         await check("pressure save failure preserves history and does not advance cursor") {
             let model = AppModel()
@@ -139,6 +140,154 @@ import Foundation
             await model.syncAll(modelContext: context, forceBackfill: true)
             return context.stressRecords == [old] && context.states[.stress] == nil
                 && context.failures == [.stress] && model.lastError != nil
+        }
+        for withCursor in [false, true] {
+            await check("custom single-day backfill never creates or changes incremental cursor: \(withCursor)") {
+                let model = AppModel()
+                model.enabledTypes = [.sleep, .stress]
+                let context = ModelContext()
+                let old = Fixture.clock.addingTimeInterval(-60 * 86400)
+                if withCursor {
+                    context.states[.sleep] = SyncState(lastSyncedEnd: old)
+                    context.states[.stress] = SyncState(lastSyncedEnd: old)
+                }
+                let day = Fixture.clock.addingTimeInterval(-30 * 86400)
+                let range = try! SyncDateRange(start: day, end: day, timeZone: MiRegion.cn.timeZone)
+                let result = await model.syncAll(modelContext: context, forceBackfill: true, range: range)
+                let repeated = await model.syncAll(modelContext: context, forceBackfill: true, range: range)
+                return result == .success && repeated == .success
+                    && context.states[.sleep]?.lastSyncedEnd == (withCursor ? old : nil)
+                    && context.states[.stress]?.lastSyncedEnd == (withCursor ? old : nil)
+                    && Fixture.calls.allSatisfy { $0.forceBackfill && $0.range == range }
+            }
+        }
+        await check("old historical backfill cannot roll a newer incremental cursor backward") {
+            let model = AppModel()
+            model.enabledTypes = [.sleep]
+            let context = ModelContext()
+            context.states[.sleep] = SyncState(lastSyncedEnd: Fixture.clock)
+            let day = Fixture.clock.addingTimeInterval(-100 * 86400)
+            let range = try! SyncDateRange(start: day, end: day, timeZone: MiRegion.cn.timeZone)
+            await model.syncAll(modelContext: context, forceBackfill: true, range: range)
+            return context.states[.sleep]?.lastSyncedEnd == Fixture.clock
+        }
+        await check("pagination failure includes type, selected dates, 200-page limit and segmentation advice") {
+            let model = AppModel()
+            model.enabledTypes = [.sleep]
+            let context = ModelContext()
+            let old = Fixture.clock.addingTimeInterval(-5 * 86400)
+            context.states[.sleep] = SyncState(lastSyncedEnd: old)
+            let day = Fixture.clock.addingTimeInterval(-30 * 86400)
+            let range = try! SyncDateRange(start: day, end: day, timeZone: MiRegion.cn.timeZone)
+            Fixture.syncError = MiAPIError.paginationLimit
+            let result = await model.syncAll(modelContext: context, forceBackfill: true, range: range)
+            let error = model.lastError ?? ""
+            return result == .failed && context.states[.sleep]?.lastSyncedEnd == old
+                && error.contains("睡眠") && error.contains(range.label) && error.contains("200")
+                && error.contains("按月、周或天") && model.lastSuccessfulSyncAt == nil
+                && model.lastRunMetric?.result == .failed
+        }
+        await check("background skips first sync without connecting or refreshing UI") {
+            let model = AppModel()
+            model.enabledTypes = [.sleep]
+            let context = ModelContext()
+            let result = await model.syncAll(modelContext: context, isBackground: true)
+            return result == .deferred && Fixture.connectionCount == 0 && Fixture.calls.isEmpty
+                && Fixture.summaryReads == 0 && Fixture.authorizationRequests == 0 && context.states.isEmpty
+        }
+        await check("background does incremental catchup only, retains lookback and avoids UI reads") {
+            let model = AppModel()
+            model.enabledTypes = [.sleep]
+            model.backfillDays = 3650
+            let context = ModelContext()
+            let old = Fixture.clock.addingTimeInterval(-90 * 86400)
+            context.states[.sleep] = SyncState(lastSyncedEnd: old)
+            let result = await model.syncAll(modelContext: context, isBackground: true)
+            guard let call = Fixture.calls.first else { return false }
+            return result == .success && !call.forceBackfill && call.range == nil && call.highWater == old
+                && abs(call.now.timeIntervalSince(old) - 86400) < 1
+                && Fixture.summaryReads == 0 && Fixture.authorizationRequests == 0
+                && model.lastSuccessfulSyncAt != nil
+        }
+        await check("background refuses explicit backfill even if called incorrectly") {
+            let model = AppModel()
+            let result = await model.syncAll(modelContext: ModelContext(), forceBackfill: true, isBackground: true)
+            return result == .deferred && Fixture.calls.isEmpty && Fixture.connectionCount == 0
+        }
+        await check("automatic sync switch off prevents a queued background run") {
+            let model = AppModel()
+            model.automaticSyncEnabled = false
+            let result = await model.syncAll(modelContext: ModelContext(), isBackground: true)
+            return result == .disabled && Fixture.connectionCount == 0 && Fixture.calls.isEmpty
+        }
+        await check("locked background defers without making requests or moving cursor") {
+            Fixture.protectedDataAvailable = false
+            let model = AppModel()
+            model.enabledTypes = [.sleep]
+            let context = ModelContext()
+            context.states[.sleep] = SyncState(lastSyncedEnd: Fixture.clock)
+            let result = await model.syncAll(modelContext: context, isBackground: true)
+            return result == .deferred && Fixture.connectionCount == 0 && Fixture.calls.isEmpty
+                && context.states[.sleep]?.lastSyncedEnd == Fixture.clock && Fixture.summaryReads == 0
+        }
+        await check("offline background stops subsequent types and preserves both cursors") {
+            Fixture.syncError = MiAPIError.network(URLError(.notConnectedToInternet))
+            let model = AppModel()
+            model.enabledTypes = [.heartRate, .sleep]
+            let context = ModelContext()
+            let old = Fixture.clock.addingTimeInterval(-86400)
+            context.states[.heartRate] = SyncState(lastSyncedEnd: old)
+            context.states[.sleep] = SyncState(lastSyncedEnd: old)
+            let result = await model.syncAll(modelContext: context, isBackground: true)
+            return result == .failed && Fixture.calls.count == 1
+                && context.states[.heartRate]?.lastSyncedEnd == old && context.states[.sleep]?.lastSyncedEnd == old
+                && Fixture.summaryReads == 0 && model.lastSyncFailure != nil
+        }
+        await check("expired credentials stop later types and require foreground login") {
+            Fixture.syncError = MiAPIError.api(code: 70016, message: "synthetic-secret-must-not-be-logged")
+            let model = AppModel()
+            model.enabledTypes = [.heartRate, .sleep]
+            let context = ModelContext()
+            context.states[.heartRate] = SyncState(lastSyncedEnd: Fixture.clock)
+            context.states[.sleep] = SyncState(lastSyncedEnd: Fixture.clock)
+            let result = await model.syncAll(modelContext: context, isBackground: true)
+            return result == .failed && Fixture.calls.count == 1 && model.authNeedsRefresh && !model.connected
+                && !(model.lastError ?? "").contains("synthetic-secret")
+        }
+        await check("background cancellation retains cursor and lock until in-flight work returns") {
+            let gate = ConnectionGate()
+            Fixture.syncGate = gate
+            let model = AppModel()
+            model.enabledTypes = [.sleep]
+            let context = ModelContext()
+            let old = Fixture.clock.addingTimeInterval(-86400)
+            context.states[.sleep] = SyncState(lastSyncedEnd: old)
+            let task = Task { await model.syncAll(modelContext: context, isBackground: true) }
+            await gate.waitUntilEntered()
+            task.cancel()
+            model.cancelSync()
+            let second = await model.syncAll(modelContext: context, forceBackfill: true)
+            let stillLocked = model.isSyncing && second == .busy && Fixture.calls.count == 1
+            gate.release()
+            let result = await task.value
+            return stillLocked && result == .cancelled && !model.isSyncing
+                && context.states[.sleep]?.lastSyncedEnd == old && context.successes.isEmpty
+                && Fixture.summaryReads == 0 && model.lastSuccessfulSyncAt == nil
+        }
+        await check("disabling automatic sync cancels active background without advancing cursor") {
+            let gate = ConnectionGate()
+            Fixture.syncGate = gate
+            let model = AppModel()
+            model.enabledTypes = [.sleep]
+            let context = ModelContext()
+            context.states[.sleep] = SyncState(lastSyncedEnd: Fixture.clock)
+            let task = Task { await model.syncAll(modelContext: context, isBackground: true) }
+            await gate.waitUntilEntered()
+            model.setAutomaticSyncEnabled(false)
+            gate.release()
+            let result = await task.value
+            return result == .cancelled && context.states[.sleep]?.lastSyncedEnd == Fixture.clock
+                && context.successes.isEmpty && !model.isSyncing
         }
         print("\(count - failures)/\(count) virtual scenarios passed")
         if failures != 0 { exit(1) }

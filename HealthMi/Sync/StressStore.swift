@@ -22,13 +22,17 @@ enum StressStore {
 
     /// 批量写入压力记录，按 externalID 去重，返回新增条数。
     @discardableResult
-    static func save(samples: [MiStressSample], in context: ModelContext) -> Int {
+    static func save(samples: [MiStressSample], in context: ModelContext) throws -> Int {
+        try Task.checkCancellation()
         guard !samples.isEmpty else { return 0 }
+        let writeContext = ModelContext(context.container)
+        writeContext.autosaveEnabled = false
         let ids = Set(samples.map(\.id))
-        let existing = fetchExistingIDs(ids: ids, in: context)
+        let descriptor = FetchDescriptor<StressRecord>(predicate: #Predicate { ids.contains($0.externalID) })
+        var existing = Set(try writeContext.fetch(descriptor).map(\.externalID))
         var added = 0
-        for sample in samples where !existing.contains(sample.id) {
-            context.insert(StressRecord(
+        for sample in samples where existing.insert(sample.id).inserted {
+            writeContext.insert(StressRecord(
                 externalID: sample.id,
                 timestamp: sample.timestamp,
                 stressScore: sample.stressScore
@@ -36,11 +40,8 @@ enum StressStore {
             added += 1
         }
         if added > 0 {
-            do {
-                try context.save()
-            } catch {
-                AppLog.stressStore.error("保存压力记录失败：\(error.localizedDescription)")
-            }
+            try Task.checkCancellation()
+            try writeContext.save()
         }
         return added
     }
@@ -48,6 +49,7 @@ enum StressStore {
     /// 只替换本次云端查询范围；使用独立上下文一次提交，保存失败不删除持久化历史。
     /// 禁用自动保存，失败时丢弃未提交的上下文，不回滚界面上下文中的其他修改。
     static func replace(samples: [MiStressSample], range: ClosedRange<Date>, in context: ModelContext) throws -> Int {
+        try Task.checkCancellation()
         let writeContext = ModelContext(context.container)
         writeContext.autosaveEnabled = false
         let start = range.lowerBound
@@ -62,6 +64,7 @@ enum StressStore {
         for sample in samples where range.contains(sample.timestamp) && seen.insert(sample.id).inserted {
             writeContext.insert(StressRecord(externalID: sample.id, timestamp: sample.timestamp, stressScore: sample.stressScore))
         }
+        try Task.checkCancellation()
         try writeContext.save()
         return seen.count
     }

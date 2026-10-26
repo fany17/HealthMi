@@ -1,5 +1,6 @@
 import HealthKit
 import Foundation
+import UIKit
 
 /// HealthKit 授权与类型清单。
 enum HealthKitManager {
@@ -8,6 +9,8 @@ enum HealthKitManager {
     static var isAvailable: Bool {
         HKHealthStore.isHealthDataAvailable()
     }
+
+    @MainActor static var protectedDataAvailable: Bool { UIApplication.shared.isProtectedDataAvailable }
 
     /// 需要写入（并读取用于去重）的健康数据类型。
     static let typesToShare: Set<HKSampleType> = [

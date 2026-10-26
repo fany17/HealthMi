@@ -10,6 +10,11 @@ struct DashboardView: View {
     @Query(sort: \StressRecord.timestamp, order: .reverse) private var recentStress: [StressRecord]
     @AppStorage("mi_region") private var regionRaw = MiRegion.cn.rawValue
     @State private var showRebackfillConfirm = false
+    @State private var backfillSelection = 30
+    @State private var customStart = Date()
+    @State private var customEnd = Date()
+    @State private var confirmedRange: SyncDateRange?
+    @Environment(\.scenePhase) private var scenePhase
     @State private var showWebLogin = false
     @State private var exportFileURL: URL?
 
@@ -23,9 +28,17 @@ struct DashboardView: View {
         return Double(recent.map(\.stressScore).reduce(0, +)) / Double(recent.count)
     }
 
-    /// “全部”显示为中文，其余显示“N 天”。
-    private var backfillDaysLabel: String {
-        model.backfillDays == 3650 ? "全部" : "\(model.backfillDays) 天"
+    private var selectedRange: SyncDateRange? {
+        if backfillSelection == 0 {
+            return try? SyncDateRange(start: customStart, end: customEnd, timeZone: region.timeZone)
+        }
+        return SyncDateRange.recent(days: backfillSelection, timeZone: region.timeZone)
+    }
+
+    private var rangeError: String? {
+        guard backfillSelection == 0 else { return nil }
+        do { _ = try SyncDateRange(start: customStart, end: customEnd, timeZone: region.timeZone); return nil }
+        catch { return error.localizedDescription }
     }
 
     var body: some View {
@@ -40,6 +53,7 @@ struct DashboardView: View {
                             Text(region.displayName).tag(region.rawValue)
                         }
                     }
+                    .disabled(model.isSyncing)
                     LabeledContent("Apple 健康", value: model.healthKitAuthorized ? "已授权" : "未授权")
                     if !model.healthKitAuthorized {
                         Button("请求健康权限") {
@@ -54,6 +68,7 @@ struct DashboardView: View {
                     Button("更新小米凭据") {
                         showWebLogin = true
                     }
+                    .disabled(model.isSyncing)
                     .sheet(isPresented: $showWebLogin) {
                         MiWebLoginView()
                     }
@@ -64,7 +79,7 @@ struct DashboardView: View {
                     VStack(alignment: .leading, spacing: 10) {
                         Label("增量同步", systemImage: "arrow.triangle.2.circlepath")
                             .font(.headline)
-                        Text("只同步上次之后的新数据，快、省流量。\n日常每天点一次这里即可。")
+                        Text("从各类型上次游标开始，并回看一天以补迟到数据。首次同步请保持 App 在前台。")
                             .font(.caption)
                             .foregroundStyle(.secondary)
                             .fixedSize(horizontal: false, vertical: true)
@@ -88,6 +103,26 @@ struct DashboardView: View {
                         .disabled(model.isSyncing)
                     }
                     .padding(.vertical, 4)
+                    if model.isSyncing {
+                        Button("取消本轮同步", role: .cancel) { model.cancelSync() }
+                    }
+                    Toggle("自动增量同步（目标每小时）", isOn: Binding(
+                        get: { model.automaticSyncEnabled },
+                        set: { model.setAutomaticSyncEnabled($0) }
+                    ))
+                    Text("使用 iOS 后台调度，实际执行时间由系统决定，不能保证每小时准点执行。后台跳过尚未首次同步的类型，不执行历史回填；锁屏、断网或到期时保留未完成进度，延后重试。")
+                        .font(.caption).foregroundStyle(.secondary)
+                    LabeledContent("上次完整同步成功") {
+                        Text(model.lastSuccessfulSyncAt?.formatted(date: .abbreviated, time: .shortened) ?? "尚无")
+                            .font(.caption)
+                    }
+                    if let failure = model.lastSyncFailure {
+                        Text("最近未完成原因：\(failure)").font(.caption).foregroundStyle(.orange)
+                    }
+                    if let metric = model.lastRunMetric {
+                        Text("最近一轮：\(metric.background ? "后台" : "前台") · \(String(format: "%.1f", metric.durationSeconds)) 秒 · \(metric.counts.requests) 次请求 · \(metric.counts.retries) 次重试 · \(metric.counts.pages) 页")
+                            .font(.caption2).foregroundStyle(.secondary)
+                    }
                 } header: {
                     Text("同步")
                 } footer: {
@@ -102,42 +137,44 @@ struct DashboardView: View {
 
                 // ---------- 重新回填历史 ----------
                 Section {
-                    VStack(alignment: .leading, spacing: 10) {
-                        Label("重新回填历史", systemImage: "clock.arrow.circlepath")
-                            .font(.headline)
-                        Text("忽略增量游标，按所选范围全量重拉并重写。\n用于补历史或修正数据，不会产生重复。")
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
-                            .fixedSize(horizontal: false, vertical: true)
-
-                        Picker("回填范围", selection: $model.backfillDays) {
-                            Text("7 天").tag(7)
-                            Text("30 天").tag(30)
-                            Text("90 天").tag(90)
-                            Text("全部（3650 天）").tag(3650)
-                        }
-                        .pickerStyle(.menu)
-
-                        Button("重新回填 \(backfillDaysLabel)") {
-                            showRebackfillConfirm = true
-                        }
-                        .disabled(model.isSyncing)
+                    Text("按所选日期重新拉取并重写 HealthMi 自己导入的数据；不改变日常增量游标。跨日睡眠会保留完整分期。")
+                        .font(.caption).foregroundStyle(.secondary)
+                    Picker("回填范围", selection: $backfillSelection) {
+                        Text("7 天").tag(7)
+                        Text("30 天").tag(30)
+                        Text("90 天").tag(90)
+                        Text("全部（最近 3650 天）").tag(3650)
+                        Text("自选日期").tag(0)
                     }
-                    .padding(.vertical, 4)
+                    .disabled(model.isSyncing)
+                    if backfillSelection == 0 {
+                        DatePicker("开始日期", selection: $customStart, in: ...Date(), displayedComponents: .date)
+                        DatePicker("结束日期", selection: $customEnd, in: ...Date(), displayedComponents: .date)
+                    }
+                    if let selectedRange {
+                        Text(selectedRange.label).font(.caption)
+                    }
+                    if let rangeError { Text(rangeError).font(.caption).foregroundStyle(.red) }
+                    Text("单次查询最多 200 页，不是固定天数限制。超限请缩短范围，按月、周或天分段回填。页数无法事先确定。")
+                        .font(.caption).foregroundStyle(.secondary)
+                    Button("重新回填所选日期") {
+                        confirmedRange = selectedRange
+                        showRebackfillConfirm = confirmedRange != nil
+                    }
+                    .disabled(model.isSyncing || selectedRange == nil)
                 } header: {
-                    Text("重新回填")
+                    Text("重新回填历史")
                 }
-                .confirmationDialog(
-                    "重新回填 \(backfillDaysLabel)？",
-                    isPresented: $showRebackfillConfirm,
-                    titleVisibility: .visible
-                ) {
-                    Button("回填 \(backfillDaysLabel)", role: .destructive) {
-                        Task { await model.syncAll(modelContext: modelContext, forceBackfill: true) }
+                .environment(\.timeZone, region.timeZone)
+                .environment(\.calendar, SyncDateRange.calendar(in: region.timeZone))
+                .confirmationDialog("确认重新回填？", isPresented: $showRebackfillConfirm, titleVisibility: .visible) {
+                    Button("按此日期范围回填") {
+                        guard let range = confirmedRange else { return }
+                        Task { await model.syncAll(modelContext: modelContext, forceBackfill: true, range: range) }
                     }
                     Button("取消", role: .cancel) {}
                 } message: {
-                    Text("将从最早 \(backfillDaysLabel) 重新拉取并重写。由于按 externalID 去重，已存在的数据不会重复。")
+                    Text("\(confirmedRange?.label ?? "")\n仅重写 HealthMi 自己导入的数据，不改变日常增量游标。")
                 }
 
                 // ---------- 数据概览 ----------
@@ -209,13 +246,14 @@ struct DashboardView: View {
                 } header: {
                     Text("各类数据状态")
                 } footer: {
-                    Text("「上次同步」就是该类的增量进度；下次增量从它往前 1 天开始拉取。")
+                    Text("此处显示各类增量同步时间；历史回填不改变增量进度。每次增量保留一天回看，补齐迟到数据。")
                 }
 
                 Section {
                     Button("退出登录并清除小米凭据", role: .destructive) {
                         model.disconnect(modelContext: modelContext)
                     }
+                    .disabled(model.isSyncing)
                 }
             }
             .navigationTitle("HealthMi")
@@ -227,12 +265,16 @@ struct DashboardView: View {
                 }
             }
             .task {
+                guard scenePhase == .active else { return }
                 await model.refreshSummary()
                 // App Intent 触发时自动开始同步
                 if SyncIntentTrigger.shouldSync {
                     SyncIntentTrigger.shouldSync = false
                     await model.syncAll(modelContext: modelContext)
                 }
+            }
+            .onChange(of: scenePhase) { _, phase in
+                if phase == .active && !model.isSyncing { Task { await model.refreshSummary() } }
             }
             .refreshable { await model.syncAll(modelContext: modelContext) }
             .sheet(isPresented: Binding(

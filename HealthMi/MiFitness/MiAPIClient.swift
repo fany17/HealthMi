@@ -17,7 +17,7 @@ enum MiAPIError: LocalizedError {
         case .api(let code, let message):
             return "小米 API 错误（code=\(code)）：\(message ?? "未知")"
         case .paginationLimit:
-            return "分页超过安全上限"
+            return "单次查询已达到 200 页安全上限；这不是统一的最大天数。请缩短范围，按月、周或天分段回填。"
         case .cursorLoop:
             return "分页游标循环，已终止"
         case .invalidResponse(let detail):
@@ -32,7 +32,9 @@ enum MiAPIError: LocalizedError {
     /// 是否可重试（网络错误、429/5xx 类 HTTP 错误）。
     var isRetriable: Bool {
         switch self {
-        case .network: return true
+        case .network(let error):
+            guard let urlError = error as? URLError else { return false }
+            return [.timedOut, .networkConnectionLost, .cannotConnectToHost].contains(urlError.code)
         case .http(let code): return code == 429 || (500...599).contains(code)
         default: return false
         }
@@ -40,7 +42,8 @@ enum MiAPIError: LocalizedError {
 
     /// 是否认证错误（passToken 过期/无效，code=70016），不可重试。
     var isAuthError: Bool {
-        if case .api(let code, _) = self, code == 70016 { return true }
+        if case .api(let code, _) = self, [70016, 401, 403].contains(code) { return true }
+        if case .http(let code) = self, [401, 403].contains(code) { return true }
         return false
     }
 }
@@ -58,19 +61,20 @@ actor MiAPIClient {
 
 
     /// 最多重试次数（不含首次请求）。
-    private let maxRetries = 3
+    private var maxRetries = 3
     /// 分页请求间隔（纳秒），避免高频请求触发小米限流。
-    private let pageDelayNs: UInt64 = 200_000_000
-
-    private var baseURL: String { MiRegion.current.baseURL }
+    private let region: MiRegion
+    private var baseURL: String { region.baseURL }
     private let dataPath = "/app/v1/data/get_fitness_data_by_time"
     private let sportRecordsPath = "/app/v1/data/get_sport_records_by_time"
-    private let maxPages = 200
+    private let metrics = RequestMetrics()
+    private var background = false
 
     private var state: MiSessionState?
     private let session: URLSession
 
-    init() {
+    init(region: MiRegion = .current) {
+        self.region = region
         let config = URLSessionConfiguration.ephemeral
         // 与 Python 一致：手动管理 Cookie，不交给 URLSession 的存储。
         config.httpCookieStorage = nil
@@ -81,9 +85,20 @@ actor MiAPIClient {
 
     var isConnected: Bool { state != nil }
 
+    func beginRun(background: Bool) {
+        self.background = background
+        // 后台交给下一次系统调度重试，不在短暂执行窗口里指数退避。
+        maxRetries = background ? 0 : 3
+        metrics.reset()
+    }
+
+    func requestCounts() -> RequestCounts { metrics.snapshot }
+
     /// 登录并建立会话。
     func connect(userId: String, passToken: String) async throws {
-        self.state = try await MiSessionClient.login(userId: userId, passToken: passToken)
+        try Task.checkCancellation()
+        self.state = try await MiSessionClient.login(userId: userId, passToken: passToken, metrics: metrics)
+        try Task.checkCancellation()
     }
 
     // MARK: - 请求签名与发送（对应 Python `_request`）
@@ -106,28 +121,34 @@ actor MiAPIClient {
         let retries = maxRetries
         var lastError: Error?
         for attempt in 0...retries {
+            try Task.checkCancellation()
             if attempt > 0 {
                 // 指数退避：1s → 2s → 4s，加 0–200ms 随机抖动
                 let baseDelay = UInt64(pow(2.0, Double(attempt - 1))) * 1_000_000_000
                 let jitter = UInt64.random(in: 0...200_000_000)
                 AppLog.apiClient.info("重试 \(attempt)/\(retries) path=\(path)")
-                try? await Task.sleep(nanoseconds: baseDelay + jitter)
+                try await Task.sleep(nanoseconds: baseDelay + jitter)
+                metrics.retry()
             }
             do {
                 return try await signedRequestOnce(path: path, dataString: dataString)
+            } catch is CancellationError {
+                throw CancellationError()
             } catch let error as MiAPIError {
+                try Task.checkCancellation()
                 if error.isAuthError || !error.isRetriable {
                     throw error
                 }
                 lastError = error
             } catch {
-                lastError = error
+                throw error
             }
         }
         throw lastError ?? MiAPIError.invalidResponse("重试耗尽")
     }
 
     private func signedRequestOnce(path: String, dataString: String) async throws -> [String: Any] {
+        try Task.checkCancellation()
         guard let state else { throw MiAPIError.notConnected }
 
         var form: [String: String] = ["data": dataString]
@@ -152,6 +173,7 @@ actor MiAPIClient {
 
         var request = URLRequest(url: URL(string: baseURL + path)!)
         request.httpMethod = "POST"
+        request.timeoutInterval = background ? 10 : 30
         request.setValue(state.cookies, forHTTPHeaderField: "Cookie")
         request.setValue("application/x-www-form-urlencoded", forHTTPHeaderField: "Content-Type")
         // Python `urlencode`：值做百分号编码（Base64 中的 + / = 必须转义）
@@ -163,10 +185,13 @@ actor MiAPIClient {
         let data: Data
         let response: URLResponse
         do {
+            metrics.request()
             (data, response) = try await session.data(for: request)
         } catch {
+            if Task.isCancelled || (error as? URLError)?.code == .cancelled { throw CancellationError() }
             throw MiAPIError.network(error)
         }
+        try Task.checkCancellation()
         if let http = response as? HTTPURLResponse, http.statusCode != 200 {
             AppLog.apiClient.error("HTTP \(http.statusCode) path=\(path)")
             throw MiAPIError.http(http.statusCode)
@@ -197,60 +222,25 @@ actor MiAPIClient {
 
     /// 按 key 拉取某时间区间的数据（对应 `_fetch_key`）。
     func fetchData(key: String, startTime: Int, endTime: Int) async throws -> [MiItem] {
-        var items: [MiItem] = []
-        var nextKey: String?
-        var seen = Set<String>()
-        var page = 0
-        while true {
-            page += 1
-            guard page <= maxPages else { throw MiAPIError.paginationLimit }
-            let body = Self.dataString(
-                startTime: startTime, endTime: endTime, key: key, nextKey: nextKey
-            )
-            let result = try await signedRequest(path: dataPath, dataString: body)
-
-            if let list = result["data_list"] as? [[String: Any]] {
-                items.append(contentsOf: list.map(Self.makeItem))
-            }
-            let hasMore = MiJSON.bool(result["has_more"]) ?? false
-            let cursor = MiJSON.string(result["next_key"])
-            if !hasMore || cursor == nil { break }
-            if seen.contains(cursor!) { throw MiAPIError.cursorLoop }
-            seen.insert(cursor!)
-            nextKey = cursor
-            // 分页请求间隔，避免高频请求触发小米限流
-            try? await Task.sleep(nanoseconds: pageDelayNs)
+        try await MiPagination.fetch { cursor in
+            try await self.fetchPage(key: key, startTime: startTime, endTime: endTime, cursor: cursor, sport: false)
         }
-        return items
     }
 
     /// 拉取运动记录（对应 `_fetch_sport_records_by_time`）。
     func fetchSportRecords(startTime: Int, endTime: Int) async throws -> [MiItem] {
-        var items: [MiItem] = []
-        var nextKey: String?
-        var seen = Set<String>()
-        var page = 0
-        while true {
-            page += 1
-            guard page <= maxPages else { throw MiAPIError.paginationLimit }
-            let body = Self.dataString(
-                startTime: startTime, endTime: endTime, key: "sport", limit: 50, nextKey: nextKey
-            )
-            let result = try await signedRequest(path: sportRecordsPath, dataString: body)
-
-            if let list = result["sport_records"] as? [[String: Any]] {
-                items.append(contentsOf: list.map(Self.makeItem))
-            }
-            let hasMore = MiJSON.bool(result["has_more"]) ?? false
-            let cursor = MiJSON.string(result["next_key"])
-            if !hasMore || cursor == nil { break }
-            if seen.contains(cursor!) { throw MiAPIError.cursorLoop }
-            seen.insert(cursor!)
-            nextKey = cursor
-            // 分页请求间隔，避免高频请求触发小米限流
-            try? await Task.sleep(nanoseconds: pageDelayNs)
+        try await MiPagination.fetch { cursor in
+            try await self.fetchPage(key: "sport", startTime: startTime, endTime: endTime, cursor: cursor, sport: true)
         }
-        return items
+    }
+
+    private func fetchPage(key: String, startTime: Int, endTime: Int, cursor: String?, sport: Bool) async throws -> MiPage {
+        let body = Self.dataString(startTime: startTime, endTime: endTime, key: key, limit: sport ? 50 : nil, nextKey: cursor)
+        let result = try await signedRequest(path: sport ? sportRecordsPath : dataPath, dataString: body)
+        metrics.page()
+        let list = result[sport ? "sport_records" : "data_list"] as? [[String: Any]] ?? []
+        return MiPage(items: list.map(Self.makeItem), hasMore: MiJSON.bool(result["has_more"]) ?? false,
+                      nextKey: MiJSON.string(result["next_key"]))
     }
 
     // MARK: - 时间换算（中国区 +08:00）
@@ -265,7 +255,8 @@ actor MiAPIClient {
 
     /// 某日历日 23:59:59(+08:00) 的时间戳。
     static func dayEndEpoch(of day: Date) -> Int {
-        dayStartEpoch(of: day) + 86_399
+        let calendar = SyncDateRange.calendar(in: regionTimeZone)
+        return Int(calendar.date(byAdding: .day, value: 1, to: calendar.startOfDay(for: day))!.timeIntervalSince1970) - 1
     }
 
     // MARK: - 原始条目提取

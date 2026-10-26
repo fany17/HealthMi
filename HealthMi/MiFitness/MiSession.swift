@@ -35,11 +35,15 @@ enum MiSessionClient {
     /// - Parameters:
     ///   - userId: account.xiaomi.com Cookie 中的 userId
     ///   - passToken: 账号 Cookie 中的 passToken（有效期短，过期后需重新获取）
-    static func login(userId: String, passToken: String) async throws -> MiSessionState {
+    static func login(userId: String, passToken: String, metrics: RequestMetrics? = nil) async throws -> MiSessionState {
+        try Task.checkCancellation()
         var request = URLRequest(url: URL(string: "https://account.xiaomi.com/pass/serviceLogin?_json=true&sid=miothealth")!)
         request.setValue("userId=\(userId); passToken=\(passToken)", forHTTPHeaderField: "Cookie")
 
+        request.timeoutInterval = 15
+        metrics?.request()
         let (data, response) = try await URLSession.shared.data(for: request)
+        try Task.checkCancellation()
         guard let http = response as? HTTPURLResponse else {
             throw MiLoginError.network(URLError(.badServerResponse))
         }
@@ -73,7 +77,11 @@ enum MiSessionClient {
         guard let redirectURL = URL(string: location) else {
             throw MiLoginError.badPayload("location 无法解析为 URL")
         }
-        let (_, redirectResponse) = try await URLSession.shared.data(from: redirectURL)
+        var redirectRequest = URLRequest(url: redirectURL)
+        redirectRequest.timeoutInterval = 15
+        metrics?.request()
+        let (_, redirectResponse) = try await URLSession.shared.data(for: redirectRequest)
+        try Task.checkCancellation()
         guard let redirectHTTP = redirectResponse as? HTTPURLResponse else {
             throw MiLoginError.network(URLError(.badServerResponse))
         }

@@ -70,15 +70,27 @@ enum SyncStateStore {
 
     static func record(
         type: SyncDataType, highWater: Date?, added: Int, in context: ModelContext
-    ) {
-        let state = ensureState(for: type, in: context)
-        state.lastSyncedEnd = highWater
+    ) throws {
+        try Task.checkCancellation()
+        let raw = type.rawValue
+        let descriptor = FetchDescriptor<SyncState>(predicate: #Predicate { $0.typeRawValue == raw })
+        let existing = try context.fetch(descriptor).first
+        let state = existing ?? SyncState(typeRawValue: raw)
+        if existing == nil { context.insert(state) }
+        let oldEnd = state.lastSyncedEnd
+        let oldSyncAt = state.lastSyncAt
+        let oldCount = state.lastAddedCount
+        state.lastSyncedEnd = highWater.map { max($0, oldEnd ?? .distantPast) } ?? oldEnd
         state.lastSyncAt = Date()
         state.lastAddedCount = added
         do {
             try context.save()
         } catch {
+            state.lastSyncedEnd = oldEnd
+            state.lastSyncAt = oldSyncAt
+            state.lastAddedCount = oldCount
             AppLog.syncStateStore.error("保存同步游标失败 (\(type.rawValue))：\(error.localizedDescription)")
+            throw error
         }
     }
 

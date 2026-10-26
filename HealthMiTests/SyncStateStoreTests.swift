@@ -15,7 +15,7 @@ final class SyncStateStoreTests: XCTestCase {
         let context = container.mainContext
         let type: SyncDataType = .heartRate
         let highWater = Date()
-        SyncStateStore.record(type: type, highWater: highWater, added: 42, in: context)
+        try SyncStateStore.record(type: type, highWater: highWater, added: 42, in: context)
 
         let state = SyncStateStore.state(for: type, in: context)
         XCTAssertNotNil(state)
@@ -26,9 +26,9 @@ final class SyncStateStoreTests: XCTestCase {
     func testClearAllRemovesAllStates() throws {
         let container = try makeContainer()
         let context = container.mainContext
-        SyncStateStore.record(type: .heartRate, highWater: Date(), added: 10, in: context)
-        SyncStateStore.record(type: .sleep, highWater: Date(), added: 5, in: context)
-        SyncStateStore.record(type: .spo2, highWater: Date(), added: 3, in: context)
+        try SyncStateStore.record(type: .heartRate, highWater: Date(), added: 10, in: context)
+        try SyncStateStore.record(type: .sleep, highWater: Date(), added: 5, in: context)
+        try SyncStateStore.record(type: .spo2, highWater: Date(), added: 3, in: context)
 
         SyncStateStore.clearAll(in: context)
 
@@ -41,8 +41,8 @@ final class SyncStateStoreTests: XCTestCase {
         let container = try makeContainer()
         let context = container.mainContext
         let type: SyncDataType = .heartRate
-        SyncStateStore.record(type: type, highWater: Date(timeIntervalSinceNow: -3600), added: 10, in: context)
-        SyncStateStore.record(type: type, highWater: Date(), added: 20, in: context)
+        try SyncStateStore.record(type: type, highWater: Date(timeIntervalSinceNow: -3600), added: 10, in: context)
+        try SyncStateStore.record(type: type, highWater: Date(), added: 20, in: context)
 
         let state = SyncStateStore.state(for: type, in: context)
         XCTAssertEqual(state?.lastAddedCount, 20)
@@ -92,4 +92,28 @@ final class SyncStateStoreTests: XCTestCase {
         XCTAssertEqual(added, 0)
         XCTAssertEqual(Set(records.map(\.externalID)), ["test_99", "test_201"])
     }
+    func testIncrementalCursorCannotMoveBackward() throws {
+        let container = try makeContainer()
+        let context = container.mainContext
+        let newer = Date(timeIntervalSince1970: 200)
+        try SyncStateStore.record(type: .sleep, highWater: newer, added: 1, in: context)
+        try SyncStateStore.record(type: .sleep, highWater: Date(timeIntervalSince1970: 100), added: 1, in: context)
+        XCTAssertEqual(SyncStateStore.state(for: .sleep, in: context)?.lastSyncedEnd, newer)
+    }
+
+    func testRepeatedStressBackfillKeepsCountAndOutsideSamples() throws {
+        let schema = Schema([StressRecord.self])
+        let container = try ModelContainer(for: schema, configurations: [ModelConfiguration(schema: schema, isStoredInMemoryOnly: true)])
+        let context = container.mainContext
+        let inside = MiStressSample(timestamp: Date(timeIntervalSince1970: 100), stressScore: 25)
+        let outside = MiStressSample(timestamp: Date(timeIntervalSince1970: 201), stressScore: 50)
+        _ = try StressStore.save(samples: [inside, outside, outside], in: context)
+        for _ in 0..<2 {
+            _ = try StressStore.replace(samples: [inside, inside], range: inside.timestamp...Date(timeIntervalSince1970: 200), in: context)
+        }
+        let records = try ModelContext(container).fetch(FetchDescriptor<StressRecord>())
+        XCTAssertEqual(records.count, 2)
+        XCTAssertEqual(Set(records.map(\.externalID)), [inside.id, outside.id])
+    }
+
 }

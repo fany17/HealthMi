@@ -36,6 +36,12 @@ enum HKQuery {
     static func predicateForObjects(withMetadataKey key: String) -> NSPredicate {
         NSPredicate { object, _ in (object as? HKObject)?.metadata?[key] != nil }
     }
+    static func predicateForObjects(withMetadataKey key: String, allowedValues: [String]) -> NSPredicate {
+        NSPredicate { object, _ in
+            guard let id = (object as? HKObject)?.metadata?[key] as? String else { return false }
+            return allowedValues.contains(id)
+        }
+    }
     static func predicateForObjects(from source: HKSource) -> NSPredicate {
         NSPredicate { object, _ in (object as? HKSample)?.owned == true }
     }
@@ -44,9 +50,13 @@ enum HKQuery {
 actor MiAPIClient {
     let items: [MiItem]
     let failure: Bool
+    var requestCount = 0
     init(items: [MiItem] = [], failure: Bool = false) { self.items = items; self.failure = failure }
+    func beginRun(background: Bool) async {}
+    func requestCounts() async -> RequestCounts { RequestCounts(requests: requestCount, retries: 0, pages: requestCount) }
     func connect(userId: String, passToken: String) async throws {}
     func fetchData(key: String, startTime: Int, endTime: Int) async throws -> [MiItem] {
+        requestCount += 1
         if failure { throw VirtualError.fetch }
         return items.filter { ($0.time ?? 0) >= startTime && ($0.time ?? 0) <= endTime }
     }

@@ -2,10 +2,12 @@ import SwiftData
 import SwiftUI
 
 @main
+@MainActor
 struct HealthMiApp: App {
     let modelContainer: ModelContainer
 
-    @State private var model = AppModel()
+    @State private var model: AppModel
+    @Environment(\.scenePhase) private var scenePhase
 
     init() {
         let schema = Schema([SyncState.self, StressRecord.self, SyncLogEntry.self])
@@ -18,6 +20,15 @@ struct HealthMiApp: App {
         } catch {
             fatalError("无法初始化 SwiftData 容器：\(error)")
         }
+        let appModel = AppModel()
+        _model = State(initialValue: appModel)
+        appModel.bootstrap()
+        let container = modelContainer
+        // 必须在应用启动时注册；不能等某个 SwiftUI 页面 .task 才注册。
+        BackgroundSync.register {
+            await appModel.syncAll(modelContext: container.mainContext, isBackground: true)
+        }
+        BackgroundSync.schedule()
     }
 
     var body: some Scene {
@@ -25,14 +36,9 @@ struct HealthMiApp: App {
             RootView()
                 .environment(model)
                 .modelContainer(modelContainer)
-                .task {
-                    model.bootstrap()
-                    await NotificationManager.requestAuthorization()
-                    BackgroundSync.register { [model, modelContainer] in
-                        let context = modelContainer.mainContext
-                        await model.syncAll(modelContext: context, isBackground: true)
-                    }
-                    BackgroundSync.schedule()
+                .onChange(of: scenePhase) { _, phase in
+                    if phase == .background { BackgroundSync.schedule() }
+                    if phase == .active { model.bootstrap() }
                 }
         }
     }

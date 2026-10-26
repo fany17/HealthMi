@@ -8,6 +8,7 @@ on:
       - 'HealthMi/**'
       - 'HealthMiTests/**'
       - 'project.yml'
+      - 'tools/virtual-sync/**'
       - '.github/workflows/ios-build.yml'
 
 permissions:
@@ -41,8 +42,15 @@ jobs:
 
       - name: Generate the original Xcode project
         run: |
+          xcodebuild -project HealthMi.xcodeproj -list -json > build/checked-in-project.json
           xcodegen generate
           xcodebuild -project HealthMi.xcodeproj -list -json > build/project.json
+
+      - name: Run offline sync safety scenarios
+        run: |
+          for suite in app engine stress; do
+            python3 tools/virtual-sync/run.py --suite "$suite" 2>&1 | tee "build/virtual-$suite.log"
+          done
 
       - name: Build for iOS Simulator
         run: |
@@ -78,6 +86,7 @@ jobs:
             -resultBundlePath build/HealthMiTests.xcresult \
             -parallel-testing-enabled NO \
             CODE_SIGNING_ALLOWED=NO test 2>&1 | tee build/xctest.log
+          xcrun xcresulttool get test-results summary --path build/HealthMiTests.xcresult > build/test-results.json
 
       - name: Archive an unsigned iPhone app after tests pass
         run: |
@@ -91,6 +100,7 @@ jobs:
             build/Payload/HealthMi.app
           ditto -c -k --keepParent build/Payload build/HealthMi-unsigned.ipa
           cp HealthMi/Support/HealthMi.entitlements build/HealthMi.entitlements
+          cp docs/MAC_HANDOFF.md build/MAC_HANDOFF.md
           shasum -a 256 build/HealthMi-unsigned.ipa > build/HealthMi-unsigned.ipa.sha256
 
       - name: Upload unsigned IPA (requires HealthKit signing before installation)
@@ -102,8 +112,11 @@ jobs:
             build/HealthMi-unsigned.ipa.sha256
             build/HealthMi.entitlements
             build/source-commit.txt
+            build/test-results.json
+            build/virtual-*.log
+            build/MAC_HANDOFF.md
           if-no-files-found: error
-          retention-days: 7
+          retention-days: 30
 
       - name: Upload build logs and native test results
         if: always()
@@ -113,7 +126,9 @@ jobs:
           path: |
             build/*.log
             build/project.json
+            build/checked-in-project.json
+            build/test-results.json
             build/source-commit.txt
             build/HealthMiTests.xcresult
           if-no-files-found: warn
-          retention-days: 7
+          retention-days: 30

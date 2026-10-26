@@ -1,39 +1,44 @@
-import BackgroundTasks
+@preconcurrency import BackgroundTasks
 import Foundation
 import os
 
-/// BGAppRefreshTask 后台同步（模拟器不会触发，需真机运行验证）。
+/// 目标间隔一小时；earliestBeginDate 只是最早时间，实际由 iOS 决定。
+@MainActor
 enum BackgroundSync {
     static let taskIdentifier = "com.healthmi.HealthMi.sync"
+    static let targetInterval: TimeInterval = 60 * 60
+    private static var registered = false
 
-    /// 当前后台同步 Task 引用，用于 expirationHandler 取消。
-    @MainActor private static var syncTask: Task<Void, Never>?
-
-    @MainActor
-    static func register(syncHandler: @escaping @MainActor () async -> Void) {
-        BGTaskScheduler.shared.register(forTaskWithIdentifier: taskIdentifier, using: nil) { task in
-            guard let refreshTask = task as? BGAppRefreshTask else {
-                task.setTaskCompleted(success: false)
-                return
-            }
-            schedule()
-            refreshTask.expirationHandler = {
-                // 系统即将挂起进程，取消正在进行的同步
-                Task { @MainActor in
-                    syncTask?.cancel()
+    static func register(syncHandler: @escaping @MainActor () async -> SyncRunResult) {
+        guard !registered else { return }
+        registered = BGTaskScheduler.shared.register(forTaskWithIdentifier: taskIdentifier, using: .main) { task in
+            MainActor.assumeIsolated {
+                guard let refreshTask = task as? BGAppRefreshTask else {
+                    task.setTaskCompleted(success: false)
+                    return
                 }
-                refreshTask.setTaskCompleted(success: false)
-            }
-            syncTask = Task { @MainActor in
-                await syncHandler()
-                refreshTask.setTaskCompleted(success: true)
+                guard UserDefaults.standard.bool(forKey: "automatic_sync_enabled") else {
+                    refreshTask.setTaskCompleted(success: false)
+                    return
+                }
+                schedule()
+                let run = BackgroundRunController { success in
+                    refreshTask.setTaskCompleted(success: success)
+                    refreshTask.expirationHandler = nil
+                }
+                refreshTask.expirationHandler = {
+                    Task { @MainActor in run.expire() }
+                }
+                run.start { await syncHandler().succeeded }
             }
         }
     }
 
     static func schedule() {
+        BGTaskScheduler.shared.cancel(taskRequestWithIdentifier: taskIdentifier)
+        guard UserDefaults.standard.bool(forKey: "automatic_sync_enabled") else { return }
         let request = BGAppRefreshTaskRequest(identifier: taskIdentifier)
-        request.earliestBeginDate = Date(timeIntervalSinceNow: 60 * 60)
+        request.earliestBeginDate = Date(timeIntervalSinceNow: targetInterval)
         do {
             try BGTaskScheduler.shared.submit(request)
         } catch {

@@ -56,7 +56,7 @@ import Foundation
         check("backfill also removes duplicates within its incoming batch", store.samples.count == 1)
 
         // The first selected day's early record must be replaced, not appended.
-        let firstDay = today.addingTimeInterval(-7 * 86400 + 1)
+        let firstDay = today.addingTimeInterval(-6 * 86400 + 1)
         let historyItem = try sleepItem(firstDay)
         let original = TypeMapper.sleepSamples(MiParser.sleepSessions([historyItem])[0])[0]
         store.samples = [original]
@@ -94,6 +94,49 @@ import Foundation
         let emptyCloud = SyncEngine(client: MiAPIClient(), writer: HealthWriter(store: store))
         _ = try await emptyCloud.sync(type: .sleep, highWater: nil, backfillDays: 7, forceBackfill: true)
         check("empty response conservatively retains existing history", store.events.isEmpty)
+        let selectedDay = today.addingTimeInterval(-2 * 86400)
+        let range = try SyncDateRange(start: selectedDay, end: selectedDay, timeZone: MiRegion.cn.timeZone)
+        let selectedItem = try sleepItem(selectedDay.addingTimeInterval(3600))
+        let selectedSample = TypeMapper.sleepSamples(MiParser.sleepSessions([selectedItem])[0])[0]
+        let beforeRange = HKSample(id: "before-selection", type: .init(.sleepAnalysis), start: range.start.addingTimeInterval(-60))
+        let afterRange = HKSample(id: "after-selection", type: .init(.sleepAnalysis), start: range.end.addingTimeInterval(1))
+        store.samples = [beforeRange, selectedSample, afterRange]
+        let singleDay = SyncEngine(client: MiAPIClient(items: [selectedItem]), writer: HealthWriter(store: store))
+        _ = try await singleDay.sync(type: .sleep, highWater: noon, backfillDays: 3650, forceBackfill: true, range: range)
+        _ = try await singleDay.sync(type: .sleep, highWater: noon, backfillDays: 3650, forceBackfill: true, range: range)
+        check("single-day repeated backfill retains both outside dates and remains idempotent", store.samples.count == 3 && store.samples.contains { $0.uuid == beforeRange.uuid } && store.samples.contains { $0.uuid == afterRange.uuid })
+
+        let overnightItem = try sleepItem(range.start.addingTimeInterval(-1800))
+        let overnight = TypeMapper.sleepSamples(MiParser.sleepSessions([overnightItem])[0])[0]
+        // This unrelated prior-day sample lies inside the expanded dedup window.
+        let neighbour = HKSample(id: "unrelated-previous-day", type: .init(.sleepAnalysis), start: range.start.addingTimeInterval(-900), end: range.start.addingTimeInterval(-600))
+        store.samples = [overnight, neighbour, afterRange]
+        let overnightEngine = SyncEngine(client: MiAPIClient(items: [overnightItem]), writer: HealthWriter(store: store))
+        _ = try await overnightEngine.sync(type: .sleep, highWater: nil, backfillDays: 1, forceBackfill: true, range: range)
+        check("cross-day replacement keeps the whole selected sleep and preserves unrelated prior-day data", store.samples.count == 3 && store.samples.contains { $0.uuid == neighbour.uuid } && store.samples.contains { $0.startDate == overnight.startDate && $0.endDate == overnight.endDate && $0.uuid != overnight.uuid })
+
+        store.events = []
+        let cancelledTask = Task {
+            try Task.checkCancellation()
+            _ = try await singleDay.sync(type: .sleep, highWater: nil, backfillDays: 1, forceBackfill: true, range: range)
+        }
+        cancelledTask.cancel()
+        do { _ = try await cancelledTask.value } catch {}
+        check("cancelled backfill does not start local replacement", store.events.isEmpty)
+        let reusedClient = MiAPIClient(items: [selectedItem])
+        let reusedEngine = SyncEngine(client: reusedClient, writer: HealthWriter(store: VirtualStore()))
+        for type in [SyncDataType.sleep, .respiratoryRate, .hrv] {
+            _ = try await reusedEngine.sync(type: type, highWater: nil, backfillDays: 1, forceBackfill: true, range: range)
+        }
+        let reusedCounts = await reusedClient.requestCounts()
+        check("sleep, respiratory rate and HRV reuse one successful query", reusedCounts.requests == 1)
+        let failedClient = MiAPIClient(failure: true)
+        let failedEngine = SyncEngine(client: failedClient, writer: HealthWriter(store: VirtualStore()))
+        for type in [SyncDataType.sleep, .respiratoryRate, .hrv] {
+            do { _ = try await failedEngine.sync(type: type, highWater: nil, backfillDays: 1, forceBackfill: true, range: range) } catch {}
+        }
+        let failedCounts = await failedClient.requestCounts()
+        check("shared sleep query failure is not downloaded again for HRV and respiratory rate", failedCounts.requests == 1)
         print("\(count - failed)/\(count) engine scenarios passed")
         if failed > 0 { exit(1) }
     }

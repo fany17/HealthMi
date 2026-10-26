@@ -20,6 +20,17 @@ def main():
     output = args.output.resolve()
     if output == root or root in output.parents:
         parser.error("output must be outside the repository")
+    output.mkdir(parents=True, exist_ok=True)
+    if args.suite in ("app", "engine"):
+        for path in ("Sync/SyncDateRange.swift", "Sync/SyncRunMetrics.swift", "MiFitness/MiRegion.swift"):
+            (output / Path(path).name).write_text((root / "HealthMi" / path).read_text())
+    if args.suite == "app":
+        engine_source = (root / "HealthMi/Sync/SyncEngine.swift").read_text()
+        window = "    func syncWindow(" + engine_source.split("    func syncWindow(", 1)[1].split("    // MARK: - 取数与映射", 1)[0]
+        (output / "Window.swift").write_text("import Foundation\nextension SyncEngine {\n" + window + "}\n")
+        api_source = (root / "HealthMi/MiFitness/MiAPIClient.swift").read_text()
+        errors = api_source.split("enum MiAPIError:", 1)[1].split("/// 小米健康云数据客户端", 1)[0]
+        (output / "MiAPIError.swift").write_text("import Foundation\nenum MiAPIError:" + errors)
     if args.suite == "stress":
         output.mkdir(parents=True, exist_ok=True)
         source = (root / "HealthMi/Sync/StressStore.swift").read_text()

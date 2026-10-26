@@ -13,7 +13,7 @@
 仍然存在的边界：
 
 - HealthKit 的保存与删除不是原子事务。保存后清理失败或进程中断可能暂留重复；需要重新回填相同范围以清理，不能依赖普通增量完成清理。
-- 运动记录走独立的 WorkoutBuilder 流程，本轮未修改其删除后重建顺序。
+- 运动回填也先保存新记录再清理捕获的旧对象；真实 WorkoutBuilder 和关联样本仍须真机验证。
 - 其他来源数据保留，不实现官方小米与 HealthMi 的跨 App 自动合并。
 - 普通样本无有效映射分组时保留旧历史，不把空响应自动解释为删除指令。
 - 日汇总增量更新、账号隔离、分页无进展及其他审计项未在本轮全部解决。
@@ -48,13 +48,13 @@ python3 tools/virtual-sync/run.py --suite engine --engine /absolute/path/to/old/
 
 ## 测试覆盖与边界
 
-### app：12 个场景
+### app：25 个场景
 
-原样编译生产 AppModel 方法体，只去除 HealthKit/SwiftData import。测试权限拒绝、前后台入口竞争、连接失败后重试、不可用设备、回填参数传递，以及压力回填保留范围外数据、失败不推进游标。
+原样编译生产 AppModel 方法体，只去除 HealthKit/SwiftData import；窗口计算、区域和指标结构使用生产实现。测试权限拒绝、前后台入口竞争、连接失败后重试、不可用设备、回填参数传递，以及压力回填保留范围外数据、失败不推进游标。
 
 引擎、权限、存储和通知均为内存替身；这里不验证真实 HealthKit 授权或 SwiftData 行为。
 
-### engine：13 个场景
+### engine：18 个场景
 
 原样编译 SyncEngine、MiParser、MiModels 和 HealthWriter 的查重/普通样本替换方法；API、样本映射、查询及存储使用替身。场景包括首日日界、完全位于查询日前的睡眠片段、同批重复记录、跨来源相同 ID、保存失败、清理失败重试、范围外历史与其他来源保留、空响应和网络失败。
 
@@ -66,7 +66,16 @@ python3 tools/virtual-sync/run.py --suite engine --engine /absolute/path/to/old/
 
 Linux Swift 6.0 的 Foundation 在测试模型上进行 Predicate key path 检查时崩溃，因此此夹具只将 `#Predicate { ... }` 适配为相同内容的闭包。**不验证 SwiftData 宏、SQL 翻译、事务实现或界面上下文刷新。** 两个原生 SwiftData 回归用例补在 SyncStateStoreTests 中，需 Xcode 执行。
 
-## 实际结果
+## 1.2.0 新增覆盖
+
+- 自选单日/历史日期、重复回填不创建或修改日常游标；分页错误包含类型、范围及分段建议。
+- 后台跳过无游标类型，只向前追赶一个日历日，保留一天回看；不开权限弹窗或读取趋势。
+- 锁屏、断网、凭据过期、父任务取消和关闭开关时保留进度；同一时刻只有一个写入会话。
+- 扩大的睡眠窗口只替换对应会话或所选范围内的数据，不误删相邻日期记录。
+- 睡眠/呼吸率/HRV 共享同一窗口的成功结果与失败结果，避免重复请求。
+- 这些场景的当前运行结果由 Actions 的 `virtual-*.log` 保存。新增原生日期、分页、SwiftData 和后台回调测试见 `HealthMiTests`，结果由 `test-results.json` 保存。
+
+## 早期版本验证记录（不代表当前版本）
 
 基于 main `a9c4de4dcc04f0fec021485946c9aa64a4075757`，Swift 6.0.3、Swift 6 模式、完整严格并发检查：
 

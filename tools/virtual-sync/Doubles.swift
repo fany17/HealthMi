@@ -10,7 +10,7 @@ struct HKQuantityType: Hashable {
 }
 let HKErrorDomain = "VirtualHealthKit"
 enum HKError {
-    enum Code: Int { case errorAuthorizationDenied = 1, errorAuthorizationNotDetermined = 2 }
+    enum Code: Int { case errorAuthorizationDenied = 1, errorAuthorizationNotDetermined = 2, errorDatabaseInaccessible = 3 }
 }
 enum MiLoginError: Error { case loginRejected }
 struct HealthSummary {}
@@ -71,16 +71,31 @@ struct SyncState { var lastSyncedEnd: Date? }
         let highWater: Date?
         let backfillDays: Int
         let forceBackfill: Bool
+        let range: SyncDateRange?
+        let now: Date
     }
     static var calls: [Call] = []
     static var writes: [SyncDataType] = []
     static var notifications: [String] = []
     static var stressSamples: [MiStressSample] = []
     static var failStressSave = false
+    static var protectedDataAvailable = true
+    static var summaryReads = 0
+    static var authorizationRequests = 0
+    static var syncError: Error?
+    static var syncGate: ConnectionGate?
     static var stressRange: ClosedRange<Date> { clock.addingTimeInterval(-7 * 86400)...clock }
-    static let clock = Date(timeIntervalSince1970: 1_780_000_000)
+    static let clock = Date()
 
     static func reset() {
+        UserDefaults.standard.set(true, forKey: "automatic_sync_enabled")
+        UserDefaults.standard.removeObject(forKey: "last_successful_sync_at")
+        UserDefaults.standard.removeObject(forKey: "last_sync_failure")
+        protectedDataAvailable = true
+        summaryReads = 0
+        authorizationRequests = 0
+        syncError = nil
+        syncGate = nil
         available = true
         stepPermission = .sharingAuthorized
         sleepPermission = .sharingAuthorized
@@ -111,13 +126,14 @@ struct SyncState { var lastSyncedEnd: Date? }
 }
 @MainActor enum HealthKitManager {
     static var isAvailable: Bool { Fixture.available }
+    static var protectedDataAvailable: Bool { Fixture.protectedDataAvailable }
     static let healthStore = VirtualHealthStore()
     static let typesToShare: Set<HKQuantityType> = [.init(.stepCount), .init(.sleepAnalysis)]
-    static func requestAuthorization() async throws {}
+    static func requestAuthorization() async throws { Fixture.authorizationRequests += 1 }
 }
 @MainActor enum HealthKitReader {
-    static func summary(days: Int) async -> HealthSummary { HealthSummary() }
-    static func trendSeries(days: Int) async -> [DailyTrend] { [] }
+    static func summary(days: Int) async -> HealthSummary { Fixture.summaryReads += 1; return HealthSummary() }
+    static func trendSeries(days: Int) async -> [DailyTrend] { Fixture.summaryReads += 1; return [] }
 }
 @MainActor enum NotificationManager {
     static func notifySyncFailure(_ message: String) async { Fixture.notifications.append(message) }
@@ -126,15 +142,17 @@ struct SyncState { var lastSyncedEnd: Date? }
     static func state(for type: SyncDataType, in context: ModelContext) -> SyncState? {
         context.states[type]
     }
-    static func record(type: SyncDataType, highWater: Date?, added: Int, in context: ModelContext) {
+    static func record(type: SyncDataType, highWater: Date?, added: Int, in context: ModelContext) throws {
+        try Task.checkCancellation()
         context.states[type] = SyncState(lastSyncedEnd: highWater)
     }
     static func clearAll(in context: ModelContext) { context.states = [:] }
 }
 @MainActor enum StressStore {
     static func clearAll(in context: ModelContext) { context.stressRecords = [] }
-    static func save(samples: [MiStressSample], in context: ModelContext) -> Int {
-        if !Fixture.failStressSave { context.stressRecords += samples }
+    static func save(samples: [MiStressSample], in context: ModelContext) throws -> Int {
+        if Fixture.failStressSave { throw MiLoginError.loginRejected }
+        context.stressRecords += samples
         return samples.count
     }
     static func replace(samples: [MiStressSample], range: ClosedRange<Date>, in context: ModelContext) throws -> Int {
@@ -151,7 +169,12 @@ struct SyncState { var lastSyncedEnd: Date? }
         if success { context.successes.append(type) } else { context.failures.append(type) }
     }
 }
+@MainActor enum BackgroundSync { static func schedule() {} }
 @MainActor final class SyncEngine {
+    let timeZone = MiRegion.current.timeZone
+    let overlapDays = 1
+    func beginRun(background: Bool) async {}
+    func requestCounts() async -> RequestCounts { RequestCounts(requests: Fixture.calls.count, retries: 0, pages: Fixture.calls.count) }
     func connect(userId: String, passToken: String) async throws {
         Fixture.connectionCount += 1
         if Fixture.connectionCount == 1, let gate = Fixture.gate { await gate.pause() }
@@ -159,9 +182,11 @@ struct SyncState { var lastSyncedEnd: Date? }
     }
     func clearCache() async {}
     func sync(type: SyncDataType, highWater: Date?, backfillDays: Int,
-              forceBackfill: Bool = false) async throws -> SyncOutcome {
+              forceBackfill: Bool = false, range: SyncDateRange? = nil, now: Date = Date()) async throws -> SyncOutcome {
         Fixture.calls.append(.init(type: type, highWater: highWater,
-                                   backfillDays: backfillDays, forceBackfill: forceBackfill))
+                                   backfillDays: backfillDays, forceBackfill: forceBackfill, range: range, now: now))
+        if let gate = Fixture.syncGate { await gate.pause() }
+        if let error = Fixture.syncError { throw error }
         let permission = type == .dailyActivity ? Fixture.stepPermission : Fixture.sleepPermission
         guard permission == .sharingAuthorized else {
             throw NSError(domain: HKErrorDomain, code: HKError.Code.errorAuthorizationDenied.rawValue)
@@ -170,7 +195,7 @@ struct SyncState { var lastSyncedEnd: Date? }
         return SyncOutcome(type: type, fetched: 1, added: 1, highWater: Fixture.clock)
     }
     func syncStress(highWater: Date?, backfillDays: Int,
-                    forceBackfill: Bool = false) async throws -> (samples: [MiStressSample], outcome: SyncOutcome, range: ClosedRange<Date>) {
-        (Fixture.stressSamples, SyncOutcome(type: .stress, fetched: Fixture.stressSamples.count, added: 0, highWater: Fixture.clock), Fixture.stressRange)
+                    forceBackfill: Bool = false, range: SyncDateRange? = nil, now: Date = Date()) async throws -> (samples: [MiStressSample], outcome: SyncOutcome, range: ClosedRange<Date>) {
+        (Fixture.stressSamples, SyncOutcome(type: .stress, fetched: Fixture.stressSamples.count, added: 0, highWater: Fixture.clock), range?.closedRange ?? Fixture.stressRange)
     }
 }
