@@ -7,12 +7,14 @@ final class SyncStateStoreTests: XCTestCase {
     private var container: ModelContainer!
     private var context: ModelContext!
 
-    override func setUp() {
-        super.setUp()
-        let schema = Schema([SyncState.self])
-        let config = ModelConfiguration(schema: schema, isStoredInMemoryOnly: true)
-        container = try! ModelContainer(for: schema, configurations: [config])
-        context = container.mainContext
+    nonisolated override func setUp() async throws {
+        try await super.setUp()
+        try await MainActor.run {
+            let schema = Schema([SyncState.self])
+            let config = ModelConfiguration(schema: schema, isStoredInMemoryOnly: true)
+            container = try ModelContainer(for: schema, configurations: [config])
+            context = container.mainContext
+        }
     }
 
     func testRecordUpdatesState() {
