@@ -84,10 +84,18 @@ struct SyncState { var lastSyncedEnd: Date? }
     static var authorizationRequests = 0
     static var syncError: Error?
     static var syncGate: ConnectionGate?
+    static var userID = "synthetic-user"
+    static var errorForCall: ((Call) -> Error?)?
+    static var emptyResponse = false
     static var stressRange: ClosedRange<Date> { clock.addingTimeInterval(-7 * 86400)...clock }
     static let clock = Date()
 
     static func reset() {
+        try! BackfillProgressStore.removeAll(url: BackfillProgressStore.defaultURL)
+        MiRegion.current = .cn
+        userID = "synthetic-user"
+        errorForCall = nil
+        emptyResponse = false
         UserDefaults.standard.set(true, forKey: "automatic_sync_enabled")
         UserDefaults.standard.removeObject(forKey: "last_successful_sync_at")
         UserDefaults.standard.removeObject(forKey: "last_sync_failure")
@@ -115,9 +123,13 @@ struct SyncState { var lastSyncedEnd: Date? }
     static func migrateIfNeeded() {}
     static func save(userId: String, passToken: String) throws {}
     static func load() -> (userId: String, passToken: String)? {
-        Fixture.credentialsExist ? ("synthetic-user", "synthetic-token") : nil
+        Fixture.credentialsExist ? (Fixture.userID, "synthetic-token") : nil
     }
     static func delete() {}
+}
+// CryptoKit hashing is checked in native XCTest; no real identities enter this harness.
+enum BackfillScope {
+    static func key(userID: String, region: MiRegion) -> String { "fixture-\(userID)-\(region.rawValue)" }
 }
 @MainActor struct VirtualHealthStore {
     func authorizationStatus(for type: HKQuantityType) -> Authorization {
@@ -185,6 +197,7 @@ struct SyncState { var lastSyncedEnd: Date? }
               forceBackfill: Bool = false, range: SyncDateRange? = nil, now: Date = Date()) async throws -> SyncOutcome {
         Fixture.calls.append(.init(type: type, highWater: highWater,
                                    backfillDays: backfillDays, forceBackfill: forceBackfill, range: range, now: now))
+        if let error = Fixture.errorForCall?(Fixture.calls.last!) { throw error }
         if let gate = Fixture.syncGate { await gate.pause() }
         if let error = Fixture.syncError { throw error }
         let permission = type == .dailyActivity ? Fixture.stepPermission : Fixture.sleepPermission
@@ -192,10 +205,13 @@ struct SyncState { var lastSyncedEnd: Date? }
             throw NSError(domain: HKErrorDomain, code: HKError.Code.errorAuthorizationDenied.rawValue)
         }
         Fixture.writes.append(type)
-        return SyncOutcome(type: type, fetched: 1, added: 1, highWater: Fixture.clock)
+        return SyncOutcome(type: type, fetched: Fixture.emptyResponse ? 0 : 1,
+                           added: Fixture.emptyResponse ? 0 : 1, highWater: Fixture.clock)
     }
     func syncStress(highWater: Date?, backfillDays: Int,
                     forceBackfill: Bool = false, range: SyncDateRange? = nil, now: Date = Date()) async throws -> (samples: [MiStressSample], outcome: SyncOutcome, range: ClosedRange<Date>) {
-        (Fixture.stressSamples, SyncOutcome(type: .stress, fetched: Fixture.stressSamples.count, added: 0, highWater: Fixture.clock), range?.closedRange ?? Fixture.stressRange)
+        let actualRange = range?.closedRange ?? Fixture.stressRange
+        let samples = Fixture.stressSamples.filter { actualRange.contains($0.timestamp) }
+        return (samples, SyncOutcome(type: .stress, fetched: samples.count, added: 0, highWater: Fixture.clock), actualRange)
     }
 }

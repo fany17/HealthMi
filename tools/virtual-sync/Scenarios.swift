@@ -105,7 +105,7 @@ import Foundation
             return Fixture.connectionCount == 0 && Fixture.calls.isEmpty
                 && context.states.isEmpty && model.lastError != nil && !model.isSyncing
         }
-        await check("backfill arguments still reach the engine unchanged") {
+        await check("90-day backfill is calendar-month bounded and ignores incremental cursor") {
             let model = AppModel()
             model.enabledTypes = [.sleep]
             model.backfillDays = 90
@@ -114,8 +114,11 @@ import Foundation
             context.states[.sleep] = SyncState(lastSyncedEnd: old)
             await model.syncAll(modelContext: context, forceBackfill: true)
             guard let call = Fixture.calls.first else { return false }
-            return Fixture.calls.count == 1 && call.type == .sleep && call.forceBackfill
-                && call.backfillDays == 90 && call.highWater == old
+            let range = SyncDateRange.recent(days: 90, timeZone: MiRegion.cn.timeZone)
+            return Fixture.calls.count >= 3 && call.type == .sleep && call.forceBackfill
+                && call.backfillDays == 90 && call.highWater == nil
+                && call.range?.start == range.start && Fixture.calls.last?.range?.end == range.end
+                && context.states[.sleep]?.lastSyncedEnd == old
         }
         await check("pressure backfill preserves history outside the selected range") {
             let model = AppModel()
@@ -289,7 +292,184 @@ import Foundation
             return result == .cancelled && context.states[.sleep]?.lastSyncedEnd == Fixture.clock
                 && context.successes.isEmpty && !model.isSyncing
         }
+        await check("all-history range is bounded by calendar months and shared between types") {
+            let model = AppModel()
+            model.enabledTypes = [.sleep, .respiratoryRate, .hrv]
+            let context = ModelContext()
+            let range = SyncDateRange.recent(days: 3650, timeZone: MiRegion.cn.timeZone)
+            let result = await model.syncAll(modelContext: context, forceBackfill: true, range: range)
+            let months = BackfillPlanner.split(range, size: .month)
+            let calls = Fixture.calls
+            return result == .success && calls.count == months.count * 3 && context.states.isEmpty
+                && calls.enumerated().allSatisfy { index, call in
+                    call.range == months[index / 3] && call.forceBackfill && call.highWater == nil
+                } && model.backfillCompletedSegments == calls.count
+        }
+        await check("successful historical empty query is skipped even after AppModel restarts") {
+            let context = ModelContext()
+            let model = AppModel()
+            model.enabledTypes = [.sleep]
+            Fixture.emptyResponse = true
+            let range = oldRange("2026-01-01", "2026-02-28")
+            let first = await model.syncAll(modelContext: context, forceBackfill: true, range: range)
+            let count = Fixture.calls.count
+            let reopened = AppModel()
+            reopened.enabledTypes = [.sleep]
+            let again = await reopened.syncAll(modelContext: context, forceBackfill: true, range: range)
+            return first == .success && again == .success && count == 2 && Fixture.calls.count == count
+                && reopened.backfillCompletedSegments == 0 && context.states.isEmpty
+        }
+        await check("failed later month resumes only unfinished dates after restart") {
+            let context = ModelContext()
+            context.states[.sleep] = SyncState(lastSyncedEnd: Fixture.clock)
+            let model = AppModel()
+            model.enabledTypes = [.sleep]
+            Fixture.errorForCall = { _ in Fixture.calls.count == 2 ? MiAPIError.network(URLError(.notConnectedToInternet)) : nil }
+            let range = oldRange("2026-01-01", "2026-03-31")
+            let first = await model.syncAll(modelContext: context, forceBackfill: true, range: range)
+            let saved = model.backfillCompletedSegments
+            Fixture.errorForCall = nil
+            Fixture.calls = []
+            let reopened = AppModel()
+            reopened.enabledTypes = [.sleep]
+            let second = await reopened.syncAll(modelContext: context, forceBackfill: true, range: range)
+            return first == .failed && saved == 1 && second == .success && Fixture.calls.count == 2
+                && Fixture.calls.first?.range?.start == oldRange("2026-02-01", "2026-02-28").start
+                && context.states[.sleep]?.lastSyncedEnd == Fixture.clock
+        }
+        await check("overfull month splits to weeks then days without marking failed parents") {
+            let context = ModelContext()
+            let model = AppModel()
+            model.enabledTypes = [.sleep]
+            let range = oldRange("2026-01-01", "2026-01-31")
+            Fixture.errorForCall = { call in
+                guard let part = call.range else { return MiAPIError.notConnected }
+                return part.endTime - part.startTime + 1 > 86400 ? MiAPIError.paginationLimit : nil
+            }
+            let first = await model.syncAll(modelContext: context, forceBackfill: true, range: range)
+            let attempts = Fixture.calls.count
+            let segments = model.backfillCompletedSegments
+            Fixture.calls = []
+            let again = await model.syncAll(modelContext: context, forceBackfill: true, range: range)
+            return first == .success && attempts == 37 && segments == 31 && again == .success
+                && Fixture.calls.isEmpty && context.states.isEmpty
+        }
+        await check("cursor loop on a month is not bypassed by date subdivision") {
+            let context = ModelContext()
+            let model = AppModel()
+            model.enabledTypes = [.sleep]
+            Fixture.syncError = MiAPIError.cursorLoop
+            let result = await model.syncAll(modelContext: context, forceBackfill: true, range: oldRange("2026-01-01", "2026-01-31"))
+            return result == .failed && Fixture.calls.count == 1 && model.backfillCompletedSegments == 0
+                && (model.lastError ?? "").contains("分页游标循环") && context.states.isEmpty
+        }
+        await check("forced recheck resets only selected dates and resumes after failure") {
+            let context = ModelContext()
+            let model = AppModel()
+            model.enabledTypes = [.sleep]
+            let whole = oldRange("2026-01-01", "2026-03-31")
+            _ = await model.syncAll(modelContext: context, forceBackfill: true, range: whole)
+            Fixture.syncError = MiAPIError.network(URLError(.notConnectedToInternet))
+            _ = await model.syncAll(modelContext: context, forceBackfill: true,
+                                    range: oldRange("2026-02-10", "2026-02-12"), recheckCompleted: true)
+            Fixture.syncError = nil
+            Fixture.calls = []
+            let resumed = await model.syncAll(modelContext: context, forceBackfill: true, range: whole)
+            return resumed == .success && Fixture.calls.count == 1
+                && Fixture.calls[0].range == oldRange("2026-02-10", "2026-02-12")
+        }
+        await check("recent two days are rechecked while old dates remain skipped") {
+            let context = ModelContext()
+            let model = AppModel()
+            model.enabledTypes = [.sleep]
+            let range = SyncDateRange.recent(days: 90, timeZone: MiRegion.cn.timeZone)
+            _ = await model.syncAll(modelContext: context, forceBackfill: true, range: range)
+            Fixture.calls = []
+            let result = await model.syncAll(modelContext: context, forceBackfill: true, range: range)
+            let recent = SyncDateRange.recent(days: 2, timeZone: MiRegion.cn.timeZone)
+            return result == .success && Fixture.calls.first?.range?.start == recent.start
+                && Fixture.calls.last?.range?.end == recent.end
+                && Fixture.calls.allSatisfy { $0.range!.start >= recent.start }
+        }
+        await check("completion is isolated by account region and newly enabled type") {
+            let context = ModelContext()
+            let range = oldRange("2026-01-01", "2026-01-31")
+            let model = AppModel()
+            model.enabledTypes = [.sleep]
+            _ = await model.syncAll(modelContext: context, forceBackfill: true, range: range)
+            model.enabledTypes = [.sleep, .hrv]
+            Fixture.calls = []
+            _ = await model.syncAll(modelContext: context, forceBackfill: true, range: range)
+            let newTypeOnly = Fixture.calls.map(\.type) == [.hrv]
+            Fixture.userID = "another-synthetic-user"
+            let otherAccount = AppModel()
+            otherAccount.enabledTypes = [.sleep]
+            _ = await otherAccount.syncAll(modelContext: context, forceBackfill: true, range: range)
+            MiRegion.current = .us
+            let otherRegion = AppModel()
+            otherRegion.enabledTypes = [.sleep]
+            let regionalRange = try! SyncDateRange(start: range.start, end: range.end, timeZone: MiRegion.us.timeZone)
+            _ = await otherRegion.syncAll(modelContext: context, forceBackfill: true, range: regionalRange)
+            return newTypeOnly && Fixture.calls.contains { $0.type == .sleep && $0.range == range }
+                && Fixture.calls.last?.range?.timeZone == MiRegion.us.timeZone && context.states.isEmpty
+        }
+        await check("cancelling second month keeps first checkpoint and excludes concurrent background") {
+            let gate = ConnectionGate()
+            let context = ModelContext()
+            context.states[.sleep] = SyncState(lastSyncedEnd: Fixture.clock)
+            let model = AppModel()
+            model.enabledTypes = [.sleep]
+            let range = oldRange("2026-01-01", "2026-03-31")
+            Fixture.errorForCall = { _ in
+                if Fixture.calls.count == 2 { Fixture.syncGate = gate }
+                return nil
+            }
+            let task = Task { await model.syncAll(modelContext: context, forceBackfill: true, range: range) }
+            await gate.waitUntilEntered()
+            model.cancelSync()
+            let overlapping = await model.syncAll(modelContext: context, isBackground: true)
+            let locked = model.isSyncing
+            gate.release()
+            let cancelled = await task.value
+            let checkpointCount = model.backfillCompletedSegments
+            Fixture.errorForCall = nil
+            Fixture.syncGate = nil
+            Fixture.calls = []
+            let resumed = await model.syncAll(modelContext: context, forceBackfill: true, range: range)
+            return overlapping == .busy && locked && cancelled == .cancelled && checkpointCount == 1
+                && resumed == .success && Fixture.calls.count == 2
+                && context.states[.sleep]?.lastSyncedEnd == Fixture.clock
+        }
+        await check("checkpoint write failure reports failure and does not mark a successful cloud response") {
+            let parent = FileManager.default.temporaryDirectory.appendingPathComponent("blocked-\(UUID())")
+            try! Data("blocked".utf8).write(to: parent)
+            defer { try? FileManager.default.removeItem(at: parent) }
+            let model = AppModel(backfillProgressURL: parent.appendingPathComponent("progress.json"))
+            model.enabledTypes = [.sleep, .hrv]
+            let context = ModelContext()
+            let range = oldRange("2026-01-01", "2026-01-31")
+            let result = await model.syncAll(modelContext: context, forceBackfill: true, range: range)
+            return result == .failed && Fixture.calls.count == 1 && model.backfillCompletedSegments == 0
+                && context.states.isEmpty && (model.lastError ?? "").contains("无法保存本机回填进度")
+        }
+        await check("logout clears historical completion so cleared local stress can be restored") {
+            let model = AppModel()
+            model.enabledTypes = [.sleep]
+            let context = ModelContext()
+            let range = oldRange("2026-01-01", "2026-01-31")
+            _ = await model.syncAll(modelContext: context, forceBackfill: true, range: range)
+            model.disconnect(modelContext: context)
+            Fixture.calls = []
+            _ = await model.syncAll(modelContext: context, forceBackfill: true, range: range)
+            return Fixture.calls.count == 1
+        }
         print("\(count - failures)/\(count) virtual scenarios passed")
         if failures != 0 { exit(1) }
+    }
+
+    static func oldRange(_ start: String, _ end: String) -> SyncDateRange {
+        let formatter = ISO8601DateFormatter()
+        return try! SyncDateRange(start: formatter.date(from: start + "T12:00:00Z")!,
+                                  end: formatter.date(from: end + "T12:00:00Z")!, timeZone: MiRegion.cn.timeZone)
     }
 }

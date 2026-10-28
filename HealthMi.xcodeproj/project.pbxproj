@@ -53,6 +53,10 @@
 		B12A3D182C1D4DEF5C32911F /* BackgroundRunControllerTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 01F1ABB030B24D455ED3702C /* BackgroundRunControllerTests.swift */; };
 		1F05605E28AE177631F305D3 /* MiPaginationTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 29E9DD16DEADFE3A6232FC12 /* MiPaginationTests.swift */; };
 		7C226EB89306B1FF705AEE12 /* SyncDateRangeTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = F4E5576074B5BACCA9DFE51F /* SyncDateRangeTests.swift */; };
+		ADE367BB2FFC2DBE3A4C4931 /* BackfillProgressStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = C42E53465193294B3FBEF42C /* BackfillProgressStore.swift */; };
+		1353A33DA146170EAC96B771 /* BackfillRunner.swift in Sources */ = {isa = PBXBuildFile; fileRef = EC8BC7D03C9F2DA7D5BF4440 /* BackfillRunner.swift */; };
+		FEE5C2AA3322140E5D3A94C0 /* BackfillScope.swift in Sources */ = {isa = PBXBuildFile; fileRef = ED8E4C21757D497F17465B95 /* BackfillScope.swift */; };
+		5BE2DBC67897F5BBFB59D858 /* BackfillTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 46D84D4F13001D74C0049A08 /* BackfillTests.swift */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXContainerItemProxy section */
@@ -115,6 +119,10 @@
 		01F1ABB030B24D455ED3702C /* BackgroundRunControllerTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BackgroundRunControllerTests.swift; sourceTree = "<group>"; };
 		29E9DD16DEADFE3A6232FC12 /* MiPaginationTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MiPaginationTests.swift; sourceTree = "<group>"; };
 		F4E5576074B5BACCA9DFE51F /* SyncDateRangeTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SyncDateRangeTests.swift; sourceTree = "<group>"; };
+		C42E53465193294B3FBEF42C /* BackfillProgressStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BackfillProgressStore.swift; sourceTree = "<group>"; };
+		EC8BC7D03C9F2DA7D5BF4440 /* BackfillRunner.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BackfillRunner.swift; sourceTree = "<group>"; };
+		ED8E4C21757D497F17465B95 /* BackfillScope.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BackfillScope.swift; sourceTree = "<group>"; };
+		46D84D4F13001D74C0049A08 /* BackfillTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BackfillTests.swift; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -153,10 +161,6 @@
 		1E268ED12B3089837DDDA467 = {
 			isa = PBXGroup;
 			children = (
-				704553F11F8B1B512D420F3B /* SyncRunMetrics.swift */,
-				7C6151E485CC822E2DCF52DB /* SyncDateRange.swift */,
-				ED44FC32A5F7C322CAAF2606 /* BackgroundRunController.swift */,
-				2915FC6BE89B7E19E6CDA5F8 /* MiPagination.swift */,
 				1E1C9D8EDADFA907F781C974 /* HealthMi */,
 				4FC01B8A697BB571479CBB96 /* HealthMiTests */,
 				17B94DB46BE96D589BA8E6E1 /* Frameworks */,
@@ -167,9 +171,6 @@
 		35A4DAA2F6123A937A7161A8 /* Resources */ = {
 			isa = PBXGroup;
 			children = (
-				F4E5576074B5BACCA9DFE51F /* SyncDateRangeTests.swift */,
-				29E9DD16DEADFE3A6232FC12 /* MiPaginationTests.swift */,
-				01F1ABB030B24D455ED3702C /* BackgroundRunControllerTests.swift */,
 				93422A7058088DE46CF0F1E3 /* Assets.xcassets */,
 			);
 			path = Resources;
@@ -188,6 +189,10 @@
 		4FC01B8A697BB571479CBB96 /* HealthMiTests */ = {
 			isa = PBXGroup;
 			children = (
+				01F1ABB030B24D455ED3702C /* BackgroundRunControllerTests.swift */,
+				29E9DD16DEADFE3A6232FC12 /* MiPaginationTests.swift */,
+				F4E5576074B5BACCA9DFE51F /* SyncDateRangeTests.swift */,
+				46D84D4F13001D74C0049A08 /* BackfillTests.swift */,
 				47011AAE9C00D0D5D82B9E7E /* MiCryptoTests.swift */,
 				03EB6FDE05824AFA45771995 /* MiParserTests.swift */,
 				76B2D77AD6CC548500DB6E71 /* MiWebLoginTests.swift */,
@@ -229,6 +234,12 @@
 		9D53BEC7B4544155388363B8 /* Sync */ = {
 			isa = PBXGroup;
 			children = (
+				ED44FC32A5F7C322CAAF2606 /* BackgroundRunController.swift */,
+				7C6151E485CC822E2DCF52DB /* SyncDateRange.swift */,
+				704553F11F8B1B512D420F3B /* SyncRunMetrics.swift */,
+				ED8E4C21757D497F17465B95 /* BackfillScope.swift */,
+				EC8BC7D03C9F2DA7D5BF4440 /* BackfillRunner.swift */,
+				C42E53465193294B3FBEF42C /* BackfillProgressStore.swift */,
 				958D958B50ADE261F3509087 /* BackgroundSync.swift */,
 				DEA2A833A9B953A9D0AE4F1C /* MigrationPlan.swift */,
 				A8E5A617ADC0F1D321F07B42 /* StressStore.swift */,
@@ -242,6 +253,7 @@
 		BB5286A8B689B48DF61A02D2 /* MiFitness */ = {
 			isa = PBXGroup;
 			children = (
+				2915FC6BE89B7E19E6CDA5F8 /* MiPagination.swift */,
 				EC94990A6984263D47FA0FD8 /* MiAPIClient.swift */,
 				9A63ED3AED8F3CE223BE655C /* MiCrypto.swift */,
 				3B81AF32160C6915D81481FD /* MiModels.swift */,
@@ -357,6 +369,7 @@
 			isa = PBXSourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
+				5BE2DBC67897F5BBFB59D858 /* BackfillTests.swift in Sources */,
 				7C226EB89306B1FF705AEE12 /* SyncDateRangeTests.swift in Sources */,
 				1F05605E28AE177631F305D3 /* MiPaginationTests.swift in Sources */,
 				B12A3D182C1D4DEF5C32911F /* BackgroundRunControllerTests.swift in Sources */,
@@ -373,6 +386,9 @@
 			isa = PBXSourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
+				FEE5C2AA3322140E5D3A94C0 /* BackfillScope.swift in Sources */,
+				1353A33DA146170EAC96B771 /* BackfillRunner.swift in Sources */,
+				ADE367BB2FFC2DBE3A4C4931 /* BackfillProgressStore.swift in Sources */,
 				3465E350BF2C222EC8B4D567 /* SyncRunMetrics.swift in Sources */,
 				9C1F912A706A728411390BAE /* SyncDateRange.swift in Sources */,
 				BB7FA39DE233A8C8D1F615D5 /* BackgroundRunController.swift in Sources */,
@@ -495,7 +511,7 @@
 				CLANG_WARN__DUPLICATE_METHOD_MATCH = YES;
 				CODE_SIGN_STYLE = Automatic;
 				COPY_PHASE_STRIP = NO;
-				CURRENT_PROJECT_VERSION = 2;
+				CURRENT_PROJECT_VERSION = 3;
 				DEBUG_INFORMATION_FORMAT = "dwarf-with-dsym";
 				ENABLE_NS_ASSERTIONS = NO;
 				ENABLE_STRICT_OBJC_MSGSEND = YES;
@@ -509,7 +525,7 @@
 				GCC_WARN_UNUSED_FUNCTION = YES;
 				GCC_WARN_UNUSED_VARIABLE = YES;
 				IPHONEOS_DEPLOYMENT_TARGET = 17.0;
-				MARKETING_VERSION = 1.2.0;
+				MARKETING_VERSION = 1.3.0;
 				MTL_ENABLE_DEBUG_INFO = NO;
 				MTL_FAST_MATH = YES;
 				PRODUCT_NAME = "$(TARGET_NAME)";
@@ -557,7 +573,7 @@
 				CLANG_WARN__DUPLICATE_METHOD_MATCH = YES;
 				CODE_SIGN_STYLE = Automatic;
 				COPY_PHASE_STRIP = NO;
-				CURRENT_PROJECT_VERSION = 2;
+				CURRENT_PROJECT_VERSION = 3;
 				DEBUG_INFORMATION_FORMAT = dwarf;
 				ENABLE_STRICT_OBJC_MSGSEND = YES;
 				ENABLE_TESTABILITY = YES;
@@ -576,7 +592,7 @@
 				GCC_WARN_UNUSED_FUNCTION = YES;
 				GCC_WARN_UNUSED_VARIABLE = YES;
 				IPHONEOS_DEPLOYMENT_TARGET = 17.0;
-				MARKETING_VERSION = 1.2.0;
+				MARKETING_VERSION = 1.3.0;
 				MTL_ENABLE_DEBUG_INFO = INCLUDE_SOURCE;
 				MTL_FAST_MATH = YES;
 				ONLY_ACTIVE_ARCH = YES;

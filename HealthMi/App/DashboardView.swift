@@ -14,6 +14,8 @@ struct DashboardView: View {
     @State private var customStart = Date()
     @State private var customEnd = Date()
     @State private var confirmedRange: SyncDateRange?
+    @State private var recheckCompleted = false
+    @State private var confirmedRecheck = false
     @Environment(\.scenePhase) private var scenePhase
     @State private var showWebLogin = false
     @State private var exportFileURL: URL?
@@ -137,7 +139,7 @@ struct DashboardView: View {
 
                 // ---------- 重新回填历史 ----------
                 Section {
-                    Text("按所选日期重新拉取并重写 HealthMi 自己导入的数据；不改变日常增量游标。跨日睡眠会保留完整分期。")
+                    Text("首次选“全部”即可自动分批回填；中断后再点会接着处理未完成日期。只重写 HealthMi 自己导入的数据，不改变日常增量游标，跨日睡眠保留完整分期。")
                         .font(.caption).foregroundStyle(.secondary)
                     Picker("回填范围", selection: $backfillSelection) {
                         Text("7 天").tag(7)
@@ -155,10 +157,13 @@ struct DashboardView: View {
                         Text(selectedRange.label).font(.caption)
                     }
                     if let rangeError { Text(rangeError).font(.caption).foregroundStyle(.red) }
-                    Text("单次查询最多 200 页，不是固定天数限制。超限请缩短范围，按月、周或天分段回填。页数无法事先确定。")
+                    Toggle("重新检查已完成日期", isOn: $recheckCompleted)
+                        .disabled(model.isSyncing)
+                    Text("默认按月查询，超过 200 页时自动拆成周、再拆成天。成功查完的旧日期会记住（包括没有记录的日期）；今天和昨天仍重新查询。旧版本没有分段记录，升级后首次需要重新检查。页数与耗时无法预估，请保持 App 在前台。")
                         .font(.caption).foregroundStyle(.secondary)
-                    Button("重新回填所选日期") {
+                    Button("开始／继续分批回填") {
                         confirmedRange = selectedRange
+                        confirmedRecheck = recheckCompleted
                         showRebackfillConfirm = confirmedRange != nil
                     }
                     .disabled(model.isSyncing || selectedRange == nil)
@@ -167,14 +172,18 @@ struct DashboardView: View {
                 }
                 .environment(\.timeZone, region.timeZone)
                 .environment(\.calendar, SyncDateRange.calendar(in: region.timeZone))
-                .confirmationDialog("确认重新回填？", isPresented: $showRebackfillConfirm, titleVisibility: .visible) {
-                    Button("按此日期范围回填") {
+                .confirmationDialog("确认分批回填？", isPresented: $showRebackfillConfirm, titleVisibility: .visible) {
+                    Button("按此日期范围分批回填") {
                         guard let range = confirmedRange else { return }
-                        Task { await model.syncAll(modelContext: modelContext, forceBackfill: true, range: range) }
+                        let recheck = confirmedRecheck
+                        // A retry after interruption should resume, not reset progress again.
+                        recheckCompleted = false
+                        Task { await model.syncAll(modelContext: modelContext, forceBackfill: true, range: range,
+                                                   recheckCompleted: recheck) }
                     }
                     Button("取消", role: .cancel) {}
                 } message: {
-                    Text("\(confirmedRange?.label ?? "")\n仅重写 HealthMi 自己导入的数据，不改变日常增量游标。")
+                    Text("\(confirmedRange?.label ?? "")\n\(confirmedRecheck ? "重新查询此范围内已完成的日期。" : "继续未完成日期；今天和昨天重新查询。")\n按月自动拆分，必要时缩小到周、天。仅重写 HealthMi 自己导入的数据，不改变日常增量游标。")
                 }
 
                 // ---------- 数据概览 ----------

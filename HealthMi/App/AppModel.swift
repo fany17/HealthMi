@@ -41,10 +41,20 @@ final class AppModel {
     /// 当前正在同步的类型索引和总数（用于进度显示）。
     var currentSyncIndex: Int = 0
     var totalSyncCount: Int = 0
+    var backfillCompletedSegments = 0
+    var backfillCurrentRange: String?
+    private let backfillProgressURL: URL
+
+    init(backfillProgressURL: URL = BackfillProgressStore.defaultURL) {
+        self.backfillProgressURL = backfillProgressURL
+    }
 
     /// 同步进度文字，如 "正在同步 3/9"。
     var syncProgressText: String? {
         guard isSyncing, totalSyncCount > 0 else { return nil }
+        if let backfillCurrentRange {
+            return "本轮已完成 \(backfillCompletedSegments) 段 · \(backfillCurrentRange)"
+        }
         return "正在处理第 \(currentSyncIndex) 类（共 \(totalSyncCount) 类）"
     }
 
@@ -117,6 +127,9 @@ final class AppModel {
     func saveCredentials(userId: String, passToken: String) async throws {
         guard !isSyncing else { return }
         try CredentialStore.save(userId: userId, passToken: passToken)
+        // A failed account replacement must not keep the previous account's live session.
+        self.engine = nil
+        connected = false
         let engine = SyncEngine()
         try await engine.connect(userId: userId, passToken: passToken)
         self.engine = engine
@@ -130,6 +143,10 @@ final class AppModel {
 
     func disconnect(modelContext: ModelContext? = nil) {
         guard !isSyncing else { return }
+        // Stress records are cleared below, so their completion ledger must also
+        // be cleared. If disk access fails, leave the account intact for retry.
+        do { try BackfillProgressStore.removeAll(url: backfillProgressURL) }
+        catch { lastError = Self.describeSyncError(error); return }
         setAutomaticSyncEnabled(false)
         engine = nil
         CredentialStore.delete()
@@ -190,16 +207,19 @@ final class AppModel {
     /// 所有入口共用 MainActor 上的占用标记，取消后等待工作真正退出才释放。
     @discardableResult
     func syncAll(modelContext: ModelContext, forceBackfill: Bool = false, isBackground: Bool = false,
-                 range: SyncDateRange? = nil) async -> SyncRunResult {
+                 range: SyncDateRange? = nil, recheckCompleted: Bool = false) async -> SyncRunResult {
         guard !isSyncing else { return .busy }
         if isBackground && !automaticSyncEnabled { return .disabled }
         isSyncing = true
         backgroundRun = isBackground
         lastError = nil
+        backfillCompletedSegments = 0
+        backfillCurrentRange = nil
         let task = Task { await self.performSync(modelContext: modelContext, forceBackfill: forceBackfill,
-                                                 isBackground: isBackground, range: range) }
+                                                 isBackground: isBackground, range: range,
+                                                 recheckCompleted: recheckCompleted) }
         activeTask = task
-        defer { activeTask = nil; isSyncing = false; backgroundRun = false }
+        defer { activeTask = nil; isSyncing = false; backgroundRun = false; backfillCurrentRange = nil }
         return await withTaskCancellationHandler {
             await task.value
         } onCancel: {
@@ -208,13 +228,14 @@ final class AppModel {
     }
 
     private func performSync(modelContext: ModelContext, forceBackfill: Bool, isBackground: Bool,
-                             range: SyncDateRange?) async -> SyncRunResult {
+                             range: SyncDateRange?, recheckCompleted: Bool) async -> SyncRunResult {
         let startedAt = Date()
         let uptime = ProcessInfo.processInfo.systemUptime
         let region = MiRegion.current
         var result: SyncRunResult = .success
         var runEngine: SyncEngine?
-        var messages: [String] = []
+        var messages: [SyncDataType: String] = [:]
+        var runOutcomes: [SyncDataType: SyncOutcome] = [:]
         do {
             try Task.checkCancellation()
             if isBackground && forceBackfill { throw AppError.backgroundBackfill }
@@ -239,6 +260,16 @@ final class AppModel {
             totalSyncCount = types.count
             currentSyncIndex = 0
 
+            var backfillStore: BackfillProgressStore?
+            var backfillScope = ""
+            if forceBackfill, let selected {
+                guard let credentials = CredentialStore.load() else { throw AppError.noCredentials }
+                backfillScope = BackfillScope.key(userID: credentials.userId, region: region)
+                let store = try BackfillProgressStore(url: backfillProgressURL)
+                if recheckCompleted { try store.invalidate(scope: backfillScope, types: types, range: selected) }
+                backfillStore = store
+            }
+
             if engineRegion != region { engine = nil; connected = false; engineRegion = region }
             if engine == nil { engine = SyncEngine(); connected = false }
             guard let engine else { throw AppError.noCredentials }
@@ -246,8 +277,20 @@ final class AppModel {
             await engine.beginRun(background: isBackground)
             try await ensureEngine()
             try Task.checkCancellation()
-            for type in types {
-                currentSyncIndex += 1
+            // Keep all types for a month together so sleep / breathing / HRV can
+            // reuse the same bounded raw response instead of downloading years
+            // of sleep three times. Failed types resume on the next user retry.
+            let work: [(type: SyncDataType, range: SyncDateRange?)]
+            if forceBackfill, let selected {
+                work = BackfillPlanner.split(selected, size: .month).flatMap { part in
+                    types.map { (type: $0, range: Optional(part)) }
+                }
+            } else { work = types.map { (type: $0, range: nil) } }
+            var failedTypes = Set<SyncDataType>()
+            for item in work {
+                let type = item.type
+                if failedTypes.contains(type) { continue }
+                currentSyncIndex = (types.firstIndex(of: type) ?? 0) + 1
                 let highWater = SyncStateStore.state(for: type, in: modelContext)?.lastSyncedEnd
                 // 老游标分轮向前追赶；从旧游标回看一天，不能直接跳到最近一天。
                 let cutoff = isBackground ? Self.backgroundCutoff(highWater: highWater, now: startedAt, timeZone: region.timeZone) : startedAt
@@ -260,7 +303,11 @@ final class AppModel {
                     try Task.checkCancellation()
                     if isBackground && !HealthKitManager.protectedDataAvailable { throw AppError.protectedDataUnavailable }
                     let outcome: SyncOutcome
-                    if type == .stress {
+                    if let backfillStore, let part = item.range {
+                        outcome = try await syncBackfill(type: type, range: part, scope: backfillScope,
+                                                         store: backfillStore, engine: engine,
+                                                         modelContext: modelContext, now: startedAt)
+                    } else if type == .stress {
                         let fetched = try await engine.syncStress(highWater: highWater, backfillDays: backfillDays,
                                                                  forceBackfill: forceBackfill, range: selected, now: cutoff)
                         try Task.checkCancellation()
@@ -277,32 +324,47 @@ final class AppModel {
                     if !forceBackfill {
                         try SyncStateStore.record(type: type, highWater: outcome.highWater, added: outcome.added, in: modelContext)
                     }
-                    outcomes[type] = outcome
-                    messages.append("\(type.displayName) +\(outcome.added)")
+                    let previous = runOutcomes[type]
+                    let total = SyncOutcome(type: type, fetched: (previous?.fetched ?? 0) + outcome.fetched,
+                                            added: (previous?.added ?? 0) + outcome.added, highWater: outcome.highWater)
+                    runOutcomes[type] = total
+                    outcomes[type] = total
+                    messages[type] = "\(type.displayName) +\(total.added)"
                     SyncLogStore.append(type: type, fetched: outcome.fetched, added: outcome.added, success: true, in: modelContext)
                 } catch {
+                    let failure = error as? BackfillFailure
+                    let cause = failure?.underlying ?? error
                     if Task.isCancelled || error is CancellationError {
                         result = .cancelled
-                        lastError = "同步已取消；未完成类型的游标保持不变，可稍后重试。"
+                        lastError = Self.cancellationMessage
                     } else {
                         result = .failed
-                        lastError = "\(type.displayName) · \(queriedRange.label)：\(Self.describeSyncError(error))"
+                        let detail = failure.map { "\n未完成分段：\($0.range.label)" } ?? ""
+                        let singleDayLimit: Bool
+                        if case MiAPIError.paginationLimit = cause, let failure {
+                            singleDayLimit = SyncDateRange.calendar(in: region.timeZone).isDate(failure.range.start, inSameDayAs: failure.range.end)
+                        } else { singleDayLimit = false }
+                        let advice = singleDayLimit ? "\n已拆到单日仍超过 200 页，本日未记为完成；请稍后重试或检查云端数据。" : ""
+                        lastError = "\(type.displayName) · 所选范围：\(queriedRange.label)\(detail)：\(Self.describeSyncError(cause))\(advice)"
                     }
-                    messages.append("\(type.displayName) 未完成")
+                    failedTypes.insert(type)
+                    messages[type] = "\(type.displayName) 未完成"
                     SyncLogStore.append(type: type, fetched: 0, added: 0, success: false, errorMessage: lastError, in: modelContext)
-                    if Self.isAuthError(error) { authNeedsRefresh = true; connected = false; self.engine = nil }
+                    if Self.isAuthError(cause) { authNeedsRefresh = true; connected = false; self.engine = nil }
                     // 断网、锁屏、认证过期或系统取消时不对后续类型重复无效请求。
-                    if result == .cancelled || Self.shouldDeferRemainingTypes(error) { break }
+                    if result == .cancelled || Self.shouldDeferRemainingTypes(cause) { break }
                 }
             }
         } catch {
             result = Task.isCancelled || error is CancellationError ? .cancelled : .failed
             if error is AppError { result = result == .cancelled ? .cancelled : .deferred }
-            lastError = result == .cancelled ? "同步已取消；未完成类型的游标保持不变，可稍后重试。" : Self.describeSyncError(error)
+            lastError = result == .cancelled ? Self.cancellationMessage : Self.describeSyncError(error)
             if Self.isAuthError(error) { authNeedsRefresh = true; connected = false; engine = nil }
         }
-        if Task.isCancelled { result = .cancelled; lastError = "同步已取消；未完成类型的游标保持不变，可稍后重试。" }
-        statusMessage = messages.isEmpty ? (lastError ?? "本轮未处理数据") : messages.joined(separator: "  ")
+        if Task.isCancelled { result = .cancelled; lastError = Self.cancellationMessage }
+        statusMessage = messages.isEmpty ? (lastError ?? "本轮未处理数据")
+            : SyncDataType.allCases.compactMap { messages[$0] }.joined(separator: "  ")
+        if forceBackfill { statusMessage += "\n本轮完成 \(backfillCompletedSegments) 个日期/类型分段；已完成的旧日期会在下次跳过。" }
         if result == .success {
             lastSuccessfulSyncAt = Date()
             lastSyncFailure = nil
@@ -323,6 +385,35 @@ final class AppModel {
         return result
     }
 
+    private static let cancellationMessage = "同步已取消；已完成的回填分段已保存，未完成分段下次重试，未完成类型的日常游标不变。"
+
+    private func syncBackfill(type: SyncDataType, range: SyncDateRange, scope: String,
+                              store: BackfillProgressStore, engine: SyncEngine,
+                              modelContext: ModelContext, now: Date) async throws -> SyncOutcome {
+        var fetched = 0
+        var added = 0
+        try await BackfillRunner.run(range: range, type: type, scope: scope, store: store, now: now) { part in
+            self.backfillCurrentRange = "\(type.displayName) · \(part.label)"
+            let outcome: SyncOutcome
+            if type == .stress {
+                let result = try await engine.syncStress(highWater: nil, backfillDays: self.backfillDays,
+                                                         forceBackfill: true, range: part, now: now)
+                try Task.checkCancellation()
+                let saved = try StressStore.replace(samples: result.samples, range: result.range, in: modelContext)
+                outcome = SyncOutcome(type: type, fetched: result.samples.count, added: saved, highWater: now)
+            } else {
+                outcome = try await engine.sync(type: type, highWater: nil, backfillDays: self.backfillDays,
+                                                forceBackfill: true, range: part, now: now)
+            }
+            try Task.checkCancellation()
+            fetched += outcome.fetched
+            added += outcome.added
+        } completed: { _ in
+            self.backfillCompletedSegments += 1
+        }
+        return SyncOutcome(type: type, fetched: fetched, added: added, highWater: now)
+    }
+
     static func backgroundCutoff(highWater: Date?, now: Date, timeZone: TimeZone) -> Date {
         guard let highWater else { return now }
         return min(now, SyncDateRange.calendar(in: timeZone).date(byAdding: .day, value: 1, to: highWater)!)
@@ -331,6 +422,7 @@ final class AppModel {
     static func describeSyncError(_ error: Error) -> String {
         if let error = error as? AppError { return error.localizedDescription }
         if let error = error as? SyncDateRange.RangeError { return error.localizedDescription }
+        if let error = error as? BackfillProgressStore.StoreError { return error.localizedDescription }
         if isAuthError(error) { return "小米凭据已过期或无效，请在前台重新登录；进度已保留。" }
         let nsError = error as NSError
         if nsError.domain == HKErrorDomain {
@@ -357,6 +449,7 @@ final class AppModel {
     }
 
     private static func shouldDeferRemainingTypes(_ error: Error) -> Bool {
+        if error is BackfillProgressStore.StoreError { return true }
         if isAuthError(error) || error is URLError { return true }
         if case MiAPIError.network = error { return true }
         if case MiAPIError.http(let code) = error, code == 429 || code >= 500 { return true }

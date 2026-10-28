@@ -115,6 +115,34 @@ import Foundation
         _ = try await overnightEngine.sync(type: .sleep, highWater: nil, backfillDays: 1, forceBackfill: true, range: range)
         check("cross-day replacement keeps the whole selected sleep and preserves unrelated prior-day data", store.samples.count == 3 && store.samples.contains { $0.uuid == neighbour.uuid } && store.samples.contains { $0.startDate == overnight.startDate && $0.endDate == overnight.endDate && $0.uuid != overnight.uuid })
 
+        // Both sides of a month boundary are queried independently. The sleep
+        // returned on its wake-up day must keep stages on the previous month.
+        let formatter = ISO8601DateFormatter()
+        let febStart = formatter.date(from: "2026-01-31T16:00:00Z")!
+        let janRange = try SyncDateRange(start: formatter.date(from: "2026-01-01T12:00:00Z")!,
+                                        end: febStart.addingTimeInterval(-1), timeZone: MiRegion.cn.timeZone)
+        let febRange = try SyncDateRange(start: febStart, end: formatter.date(from: "2026-02-28T12:00:00Z")!, timeZone: MiRegion.cn.timeZone)
+        let monthCrossing = try sleepItem(febStart.addingTimeInterval(-1800))
+        let priorItem = try sleepItem(febStart.addingTimeInterval(-86400))
+        let monthStore = VirtualStore()
+        monthStore.samples = [foreign, outside]
+        let monthClient = MiAPIClient(items: [priorItem, monthCrossing])
+        let monthEngine = SyncEngine(client: monthClient, writer: HealthWriter(store: monthStore))
+        for _ in 0..<2 {
+            for part in [janRange, febRange] {
+                for type in [SyncDataType.sleep, .respiratoryRate, .hrv] {
+                    _ = try await monthEngine.sync(type: type, highWater: nil, backfillDays: 3650,
+                                                  forceBackfill: true, range: part)
+                }
+            }
+        }
+        check("repeated month batches keep cross-month sleep complete and preserve other sources",
+              monthStore.samples.count == 4
+                && monthStore.samples.contains { $0.startDate == febStart.addingTimeInterval(-1800) && $0.endDate == febStart.addingTimeInterval(1800) }
+                && monthStore.samples.contains { $0.uuid == foreign.uuid }
+                && monthStore.samples.contains { $0.uuid == outside.uuid })
+        check("sleep breathing and HRV reuse one query per month", await monthClient.requestCounts().requests == 4)
+
         store.events = []
         let cancelledTask = Task {
             try Task.checkCancellation()

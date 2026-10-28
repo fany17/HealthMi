@@ -25,6 +25,8 @@ def main():
         for path in ("Sync/SyncDateRange.swift", "Sync/SyncRunMetrics.swift", "MiFitness/MiRegion.swift"):
             (output / Path(path).name).write_text((root / "HealthMi" / path).read_text())
     if args.suite == "app":
+        for name in ("BackfillProgressStore", "BackfillRunner"):
+            (output / f"{name}.swift").write_text((root / f"HealthMi/Sync/{name}.swift").read_text())
         engine_source = (root / "HealthMi/Sync/SyncEngine.swift").read_text()
         window = "    func syncWindow(" + engine_source.split("    func syncWindow(", 1)[1].split("    // MARK: - 取数与映射", 1)[0]
         (output / "Window.swift").write_text("import Foundation\nextension SyncEngine {\n" + window + "}\n")
