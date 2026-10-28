@@ -87,6 +87,7 @@ struct SyncState { var lastSyncedEnd: Date? }
     static var userID = "synthetic-user"
     static var errorForCall: ((Call) -> Error?)?
     static var emptyResponse = false
+    static var failCredentialSave = false
     static var stressRange: ClosedRange<Date> { clock.addingTimeInterval(-7 * 86400)...clock }
     static let clock = Date()
 
@@ -96,6 +97,7 @@ struct SyncState { var lastSyncedEnd: Date? }
         userID = "synthetic-user"
         errorForCall = nil
         emptyResponse = false
+        failCredentialSave = false
         UserDefaults.standard.set(true, forKey: "automatic_sync_enabled")
         UserDefaults.standard.removeObject(forKey: "last_successful_sync_at")
         UserDefaults.standard.removeObject(forKey: "last_sync_failure")
@@ -121,7 +123,9 @@ struct SyncState { var lastSyncedEnd: Date? }
 
 @MainActor enum CredentialStore {
     static func migrateIfNeeded() {}
-    static func save(userId: String, passToken: String) throws {}
+    static func save(userId: String, passToken: String) throws {
+        if Fixture.failCredentialSave { throw MiLoginError.loginRejected }
+    }
     static func load() -> (userId: String, passToken: String)? {
         Fixture.credentialsExist ? (Fixture.userID, "synthetic-token") : nil
     }

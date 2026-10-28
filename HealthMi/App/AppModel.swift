@@ -126,10 +126,10 @@ final class AppModel {
 
     func saveCredentials(userId: String, passToken: String) async throws {
         guard !isSyncing else { return }
-        try CredentialStore.save(userId: userId, passToken: passToken)
         // A failed account replacement must not keep the previous account's live session.
         self.engine = nil
         connected = false
+        try CredentialStore.save(userId: userId, passToken: passToken)
         let engine = SyncEngine()
         try await engine.connect(userId: userId, passToken: passToken)
         self.engine = engine

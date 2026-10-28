@@ -463,6 +463,17 @@ import Foundation
             _ = await model.syncAll(modelContext: context, forceBackfill: true, range: range)
             return Fixture.calls.count == 1
         }
+        await check("failed credential replacement cannot retain the previous live session") {
+            let model = AppModel()
+            model.enabledTypes = [.sleep]
+            _ = await model.syncAll(modelContext: ModelContext())
+            guard model.connected else { return false }
+            Fixture.failCredentialSave = true
+            do {
+                try await model.saveCredentials(userId: "synthetic-replacement", passToken: "synthetic-token")
+                return false
+            } catch { return !model.connected }
+        }
         print("\(count - failures)/\(count) virtual scenarios passed")
         if failures != 0 { exit(1) }
     }
